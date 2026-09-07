@@ -6,7 +6,7 @@ export PATH
 # Keep only the latest run's output in RAM.
 exec > /tmp/awg-restart.log 2>&1
 date '+%Y-%m-%d %H:%M:%S %Z'
-/opt/etc/init.d/s52awg-opgktun0 restart
+/opt/etc/init.d/S52awg-opkgtun0 restart
 status=$?
 echo "restart exit code: $status"
 exit "$status"

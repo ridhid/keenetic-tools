@@ -7,7 +7,7 @@ export PATH
 JOB=/opt/sbin/awg-scheduled-restart
 CRONTAB=/opt/etc/crontab
 CRON_INIT=/opt/etc/init.d/S10cron
-SERVICE=/opt/etc/init.d/s52awg-opgktun0
+SERVICE=/opt/etc/init.d/S52awg-opkgtun0
 MARKER='# keenetic-awg-restart: managed by install-awg-cron.sh'
 WORK=
 
@@ -51,7 +51,7 @@ export PATH
 # Keep only the latest run's output in RAM.
 exec > /tmp/awg-restart.log 2>&1
 date '+%Y-%m-%d %H:%M:%S %Z'
-/opt/etc/init.d/s52awg-opgktun0 restart
+/opt/etc/init.d/S52awg-opkgtun0 restart
 status=$?
 echo "restart exit code: $status"
 exit "$status"
@@ -59,7 +59,10 @@ EOF
 sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$WORK/legacy" > "$WORK/legacy-code"
 is_legacy() {
     [ ! -L "$1" ] && [ -f "$1" ] || return 1
-    sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$1" > "$WORK/candidate-code"
+    # Recognize the original typo only when migrating an old cron script.
+    sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d;
+        s|^/opt/etc/init.d/s52awg-opgktun0 restart$|/opt/etc/init.d/S52awg-opkgtun0 restart|' \
+        "$1" > "$WORK/candidate-code"
     cmp -s "$WORK/candidate-code" "$WORK/legacy-code"
 }
 
@@ -92,7 +95,7 @@ PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 exec > /tmp/awg-restart.log 2>&1
 date '+%Y-%m-%d %H:%M:%S %Z'
-/opt/etc/init.d/s52awg-opgktun0 restart
+/opt/etc/init.d/S52awg-opkgtun0 restart
 status=$?
 echo "restart exit code: $status"
 exit "$status"
