@@ -1,0 +1,17 @@
+# Local editor and agent state
+.agents/
+.codex/
+.idea/
+.vscode/
+*~
+
+# Local router data and credentials
+.env
+.env.*
+*.key
+*.pem
+*.log
+*.backup
+*.backup.*
+backups/
+private/
