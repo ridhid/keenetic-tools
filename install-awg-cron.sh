@@ -93,10 +93,52 @@ if [ "$ACTION" = install ]; then
         cat <<'EOF'
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
-exec > /tmp/awg-restart.log 2>&1
+SERVICE=/opt/etc/init.d/S52awg-opkgtun0
+LOG=/tmp/awg-restart.log
+LOCK=/tmp/awg-restart.lock
+TIMEOUT=120
+
+# Skip while a previous run is alive; recover a stale lock.
+if ! mkdir "$LOCK" 2>/dev/null; then
+    old=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') skipped: previous run (PID $old) is still active" >> "$LOG"
+        exit 0
+    fi
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || exit 1
+fi
+trap 'rm -rf "$LOCK"' 0
+trap 'exit 143' HUP INT TERM
+echo "$$" > "$LOCK/pid"
+
+# Keep only the latest run's output in RAM; append mode so a skip note survives.
+: > "$LOG"
+exec >> "$LOG" 2>&1
 date '+%Y-%m-%d %H:%M:%S %Z'
-/opt/etc/init.d/S52awg-opkgtun0 restart
+"$SERVICE" restart &
+pid=$!
+# Watchdog: TERM after $TIMEOUT seconds, KILL 5 seconds later.
+(
+    i=0
+    while [ "$i" -lt "$TIMEOUT" ]; do
+        sleep 1
+        kill -0 "$pid" 2>/dev/null || exit 0
+        i=$((i + 1))
+    done
+    : > "$LOCK/timeout"
+    kill -TERM "$pid" 2>/dev/null
+    sleep 5
+    kill -KILL "$pid" 2>/dev/null
+) &
+watchdog=$!
+wait "$pid"
 status=$?
+wait "$watchdog"
+if [ -e "$LOCK/timeout" ]; then
+    echo "restart timed out after ${TIMEOUT}s and was killed"
+    status=124
+fi
 echo "restart exit code: $status"
 exit "$status"
 EOF
