@@ -93,10 +93,33 @@ if [ "$ACTION" = install ]; then
         cat <<'EOF'
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
-exec > /tmp/awg-restart.log 2>&1
+SERVICE=/opt/etc/init.d/S52awg-opkgtun0
+LOG=/tmp/awg-restart.log
+PIDFILE=/tmp/awg-restart.pid
+TIMEOUT=120
+
+# Skip this run while the previous one is still alive.
+old=$(cat "$PIDFILE" 2>/dev/null)
+if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S %Z') skipped: previous run (PID $old) is still active" >> "$LOG"
+    exit 0
+fi
+echo "$$" > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' 0
+
+# Keep only the latest run's output in RAM; append mode so a skip note survives.
+: > "$LOG"
+exec >> "$LOG" 2>&1
 date '+%Y-%m-%d %H:%M:%S %Z'
-/opt/etc/init.d/S52awg-opkgtun0 restart
+"$SERVICE" restart &
+pid=$!
+# Kill the restart if it runs longer than $TIMEOUT seconds.
+( sleep "$TIMEOUT"; kill -KILL "$pid" 2>/dev/null ) &
+watchdog=$!
+wait "$pid"
 status=$?
+kill "$watchdog" 2>/dev/null
+[ "$status" -ne 137 ] || echo "restart timed out after ${TIMEOUT}s and was killed"
 echo "restart exit code: $status"
 exit "$status"
 EOF
