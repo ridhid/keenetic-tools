@@ -4,9 +4,12 @@
 
 ## Что это
 
-Набор shell-утилит для роутеров **Keenetic с Entware**. Сейчас одна утилита —
-установщик cron-задания, которое периодически перезапускает AmneziaWG-туннель
-через `/opt/etc/init.d/S52awg-opkgtun0 restart`.
+Набор shell-утилит для роутеров **Keenetic с Entware**:
+
+- `install-awg-cron.sh` — установщик cron-задания, которое периодически
+  перезапускает AmneziaWG-туннель через `/opt/etc/init.d/S52awg-opkgtun0 restart`;
+- `awg-monitor.sh` — мониторинг качества туннеля (замеры, события, дампы при
+  сбоях, снимки конфигурации).
 
 Код исполняется **только на роутере** (Entware, BusyBox `ash`, под root), а не на
 машине разработчика. Пользователь скачивает скрипт напрямую из ветки `main`
@@ -16,7 +19,8 @@
 
 | Файл | Назначение |
 |------|------------|
-| `install-awg-cron.sh` | Единственная точка входа. `install [hourly\|daily]` / `uninstall`. Самодостаточный: ничего не скачивает, тело задания встроено heredoc'ом. |
+| `awg-monitor.sh` | Монитор туннеля; этот же файл — установщик (`install [--log-dir DIR]` копирует себя в `/opt/bin/awg-monitor`). |
+| `install-awg-cron.sh` | Точка входа рестарта по cron. `install [hourly\|daily]` / `uninstall`. Самодостаточный: ничего не скачивает, тело задания встроено heredoc'ом. |
 | `awg-restart` | **Legacy**. Старый скрипт из `/opt/etc/cron.hourly/`. Нужен только как эталон для миграции; новые установки его не используют. |
 | `README.md` | Инструкция для пользователя (на русском) с однострочником установки. |
 
@@ -39,6 +43,25 @@
   Если жив PID из `/tmp/awg-restart.pid`, запуск пропускается с записью в лог.
 - Лог последнего запуска: `/tmp/awg-restart.log` (перезаписывается, RAM;
   строка о пропуске из-за lock дописывается в конец).
+
+## Как работает awg-monitor
+
+- Маркер `# keenetic-tools: awg-monitor` — 2-я строка скрипта, 1-я строка
+  `/opt/etc/awg-monitor.conf` и суффикс строки в `/opt/etc/crontab`
+  (`* * * * * root /opt/bin/awg-monitor collect`). Не менять — по нему
+  находятся установленные копии.
+- Каталог логов задаётся `--log-dir`, хранится в конфиге (`LOG_DIR`). Установщик
+  отказывается от каталогов на `tmpfs`/`ramfs`/внутренней флеш-ФС. В каталоге
+  лежит файл-маркер `.awg-monitor`: без него `collect` ничего не пишет (диск
+  отключён — не писать в пустую точку монтирования в RAM).
+- `collect` (cron, раз в минуту): lock `/tmp/awg-monitor.lock`, замер, строка
+  `key=value` в `samples/ДАТА.log`, события в `events.log` + `logger`, дамп при
+  переходе в `DOWN`, хэш конфигурации раз в `CONFIG_EVERY` минут → снимок при
+  изменении, раз в сутки удаление старше `KEEP_DAYS`, состояние в `state`.
+- Секреты (`PrivateKey`, `PresharedKey`) вырезаются из снимков; `bundle`
+  проверяет архив на ключи из конфига AWG и удаляет его при совпадении.
+- Формат строки замера читают `report` и `status`: при добавлении полей не
+  менять смысл существующих ключей.
 
 ## Правила для изменений
 
@@ -69,15 +92,19 @@
 в `/opt`, вызывает `opkg` и init-скрипты. Доступные проверки:
 
 ```sh
-sh -n install-awg-cron.sh awg-restart          # синтаксис
-shellcheck --shell=sh install-awg-cron.sh awg-restart   # если установлен
-busybox ash -n install-awg-cron.sh             # если есть busybox
+sh -n install-awg-cron.sh awg-restart awg-monitor.sh   # синтаксис
+shellcheck --shell=sh -e SC2015,SC2013 install-awg-cron.sh awg-restart awg-monitor.sh   # если установлен
+busybox ash -n install-awg-cron.sh awg-monitor.sh      # если есть busybox
 git ls-files --eol                             # убедиться, что везде lf
 ```
 
 Если нужно проверить логику — делать это в изолированной копии с подменой
 путей (`JOB`, `CRONTAB`, `CRON_INIT`, `SERVICE`) на каталог во временной
-директории, не трогая реальную систему.
+директории, не трогая реальную систему. Для `awg-monitor.sh` — подменить
+`PATH` (заглушки `awg`, `ping`, `pgrep`, `curl`, `ndmc`, `opkg`, `logger`, `id`),
+`/opt/`, `/tmp/awg-monitor*` и `/sys/class/net` через `sed` в копии и прогнать
+сценарии `collect` (OK, потери, DOWN по каждой причине, отключённый диск, lock),
+затем `report`, `diff`, `bundle`, `uninstall --purge`.
 
 ## Git
 
