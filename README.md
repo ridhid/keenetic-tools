@@ -52,7 +52,9 @@ opkg update && opkg install curl ca-bundle && curl -fSL https://raw.githubuserco
 | Команда | Что делает |
 |---------|------------|
 | `awg-monitor check` | замер прямо сейчас, ничего не записывает |
-| `awg-monitor status` | текущее состояние, последний замер и события |
+| `awg-monitor status` | что установлено и запущено (cron, tcpdump), сколько данных на диске и в памяти; затем состояние туннеля |
+| `awg-monitor enable collect\|capture` | включить сбор по cron / поиск доменов мимо туннеля |
+| `awg-monitor disable collect\|capture [--purge]` | выключить и сразу остановить; `capture --purge` удаляет и собранные данные |
 | `awg-monitor report [24h\|7d]` | доля времени по состояниям, список сбоев с причинами, перезапуски, RTT, память |
 | `awg-monitor snapshot [метка]` | снимок конфигурации (например, `snapshot до-смены-mtu`) |
 | `awg-monitor snapshots` | список снимков |
@@ -98,8 +100,23 @@ opkg update && opkg install curl ca-bundle && curl -fSL https://raw.githubuserco
 `missed/ДАТА.log` — соединения мимо туннеля, `events.log` — события, `dumps/` — дампы при сбоях,
 `snapshots/` — снимки конфигурации, `bundles/` — архивы. Замеры, дампы и архивы хранятся 14 дней.
 
-**Удалить** (логи остаются; с `--purge` — удаляются):
+**Разовый сбор без следов** (например, найти домены мимо туннеля):
 
 ```sh
-awg-monitor uninstall
+opkg install tcpdump
+awg-monitor enable capture        # через минуту запустится захват DNS
+awg-monitor missed                # смотреть результаты, сколько нужно
+awg-monitor disable capture --purge   # остановить tcpdump, удалить данные в памяти и на диске
+opkg remove tcpdump
+awg-monitor status                # убедиться, что ничего не запущено
 ```
+
+**Удалить** (логи остаются; с `--purge` удаляются все следы: логи, резервные копии crontab,
+копия установщика `/opt/awg-monitor.sh`, файлы в `/tmp`):
+
+```sh
+awg-monitor uninstall --purge
+```
+
+Пакеты Entware (`cron`, `curl`, `ca-bundle`, `tcpdump`) не удаляются — они могут быть нужны другим
+программам; `uninstall` перечисляет установленные. Записи в системном журнале роутера остаются до его очистки.

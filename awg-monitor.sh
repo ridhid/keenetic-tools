@@ -7,6 +7,8 @@ PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 BIN=/opt/bin/awg-monitor
+# Where the README one-liner downloads the installer.
+SRC_COPY=/opt/awg-monitor.sh
 CONF=/opt/etc/awg-monitor.conf
 CRONTAB=/opt/etc/crontab
 CRON_INIT=/opt/etc/init.d/S10cron
@@ -58,9 +60,11 @@ usage() {
     cat <<'EOF'
 Использование:
   sh awg-monitor.sh install [--log-dir DIR]  — установить или обновить
-  awg-monitor uninstall [--purge]   — удалить; с --purge удалить и логи
+  awg-monitor uninstall [--purge]   — удалить; с --purge — все следы: логи, копии crontab, установщик
+  awg-monitor status                — что установлено, что запущено, сколько данных; состояние туннеля
+  awg-monitor enable collect|capture        — включить сбор по cron / поиск доменов мимо туннеля
+  awg-monitor disable collect|capture [--purge] — выключить и остановить; --purge удаляет данные функции
   awg-monitor check                 — замер прямо сейчас, ничего не записывает
-  awg-monitor status                — последний замер и последние события
   awg-monitor report [24h|7d]       — сводка за период (по умолчанию 24h)
   awg-monitor snapshot [метка]      — снять конфигурацию
   awg-monitor snapshots             — список снимков
@@ -880,6 +884,194 @@ cmd_missed() {
     fi
 }
 
+# ---------- components: status / enable / disable ----------
+
+cron_on() { grep -Fq "$MARKER" "$CRONTAB" 2>/dev/null; }
+
+# Waits for a running collect to finish, then holds the lock until exit.
+lock_wait() {
+    n=0
+    until acquire_lock; do
+        n=$((n + 1))
+        [ "$n" -lt 90 ] || die "Сбор (collect) не завершается: занят $LOCK."
+        sleep 1
+    done
+}
+
+ram_files() {
+    for f in /tmp/awg-monitor*; do
+        if [ -e "$f" ]; then echo "$f"; fi
+    done
+}
+
+# Removes RAM state of the DNS capture; tcpdump must already be stopped.
+cap_clean() {
+    cap_stop
+    rm -f "$DNS_MAP" "$DNS_MAP.tmp" "$CT_SEEN" "$CT_SEEN.tmp" "$INCLUDES" "$INCLUDES.tmp" "$CAP_PID.missing"
+}
+
+conf_set() {
+    owned "$CONF" || die "Нет $CONF — сначала установите: sh awg-monitor.sh install"
+    awk -v k="$1" -v v="$2" 'index($0, k "=") == 1 { print k "=" v; done = 1; next } { print }
+        END { if (!done) print k "=" v }' "$CONF" > "$CONF.tmp.$$"
+    mv "$CONF.tmp.$$" "$CONF"
+}
+
+size_of() {
+    if [ -e "$1" ]; then du -sh "$1" 2>/dev/null | awk '{ print $1 }'; else echo '-'; fi
+}
+
+pkg_list() {
+    opkg list-installed 2>/dev/null | awk '$1 == "cron" || $1 == "curl" || $1 == "ca-bundle" || $1 == "tcpdump" { printf "%s%s", (n++ ? ", " : ""), $1 }'
+}
+
+row() { echo "  $1: $2"; }
+
+show_components() {
+    echo 'Установлено:'
+    if owned "$BIN"; then row 'скрипт' "$BIN"; else row 'скрипт' 'нет'; fi
+    if owned "$CONF"; then row 'настройки' "$CONF"; else row 'настройки' 'нет'; fi
+    if owned "$SRC_COPY"; then row 'копия установщика' "$SRC_COPY (не нужна после установки)"; fi
+    if cron_on; then row 'задание cron (раз в минуту)' 'ВКЛЮЧЕНО'; else row 'задание cron (раз в минуту)' 'выключено'; fi
+    n=0
+    for f in "$CRONTAB".awg-monitor-backup.*; do
+        if [ -f "$f" ]; then n=$((n + 1)); fi
+    done
+    [ "$n" -eq 0 ] || row 'резервные копии crontab' "$n шт. ($CRONTAB.awg-monitor-backup.*)"
+
+    echo
+    echo 'Запущено сейчас:'
+    p=$(cat "$LOCK/pid" 2>/dev/null || :)
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then row 'сбор (collect)' "выполняется, PID $p"; else row 'сбор (collect)' 'не выполняется'; fi
+    if cap_running; then row 'захват DNS (tcpdump)' "ЗАПУЩЕН, PID $(cat "$CAP_PID")"; else row 'захват DNS (tcpdump)' 'не запущен'; fi
+
+    echo
+    echo 'Функции:'
+    if cron_on; then row 'замеры туннеля' 'включены'; else row 'замеры туннеля' 'выключены (нет задания cron)'; fi
+    set -- $DOMAINS_WATCH
+    if [ "$#" -gt 0 ]; then row 'проверка DOMAINS_WATCH' "$# доменов, раз в $DOMAINS_EVERY мин"; else row 'проверка DOMAINS_WATCH' 'выключена (список пуст)'; fi
+    if [ "$DNS_CAPTURE" = 1 ]; then
+        t='ВКЛЮЧЁН'
+        command -v tcpdump >/dev/null 2>&1 || t="$t, но tcpdump не установлен"
+        cron_on || t="$t, но задание cron выключено"
+        row 'поиск мимо туннеля (capture)' "$t"
+    else
+        row 'поиск мимо туннеля (capture)' 'выключен'
+    fi
+
+    echo
+    echo 'Данные:'
+    if logdir_ok; then
+        row 'каталог логов' "$LOG_DIR ($(size_of "$LOG_DIR"))"
+        for d in samples domains missed dumps snapshots bundles; do
+            [ -e "$LOG_DIR/$d" ] && echo "    $d ($(size_of "$LOG_DIR/$d"))"
+        done
+    elif [ -n "$LOG_DIR" ]; then
+        row 'каталог логов' "$LOG_DIR — недоступен (диск не подключён или удалён)"
+    else
+        row 'каталог логов' 'не задан'
+    fi
+    ram=$(ram_files)
+    if [ -n "$ram" ]; then
+        row 'в памяти (/tmp)' ''
+        for f in $ram; do echo "    $f ($(size_of "$f"))"; done
+    else
+        row 'в памяти (/tmp)' 'ничего'
+    fi
+    pk=$(pkg_list)
+    row 'пакеты Entware' "${pk:-нет} (удаляются только вручную: opkg remove ...)"
+
+    echo
+    echo 'Управление:'
+    if ! owned "$BIN" && ! owned "$CONF" && ! cron_on && ! cap_running && [ -z "$ram" ]; then
+        echo '  awg-monitor не установлен и ничего не запущено.'
+        echo '  Установить: sh awg-monitor.sh install --log-dir DIR'
+        return 0
+    fi
+    if [ "$DNS_CAPTURE" = 1 ] || cap_running; then
+        echo '  awg-monitor disable capture --purge   — остановить поиск мимо туннеля и удалить его данные'
+    else
+        echo '  awg-monitor enable capture            — включить поиск мимо туннеля (нужен tcpdump)'
+    fi
+    if cron_on; then
+        echo '  awg-monitor disable collect           — выключить весь сбор (cron), данные остаются'
+    elif owned "$BIN"; then
+        echo '  awg-monitor enable collect            — включить сбор по cron'
+    fi
+    echo '  awg-monitor uninstall --purge         — удалить всё и все следы'
+}
+
+cmd_enable() {
+    [ "$#" -eq 1 ] || die 'Укажите: awg-monitor enable collect|capture'
+    [ "$(id -u)" = 0 ] || die 'Запустите под root в shell Entware.'
+    owned "$BIN" || die "awg-monitor не установлен ($BIN). Установите: sh awg-monitor.sh install"
+    case $1 in
+        collect)
+            WORK=$(mktemp -d /tmp/awg-monitor-install.XXXXXX)
+            trap 'rm -rf "$WORK"' 0
+            [ -f "$CRONTAB" ] || die "Не найден $CRONTAB."
+            update_crontab add
+            "$CRON_INIT" restart
+            echo 'Сбор по cron включён (раз в минуту).' ;;
+        capture)
+            command -v tcpdump >/dev/null 2>&1 || die 'Нужен tcpdump: opkg install tcpdump'
+            require_logdir
+            conf_set DNS_CAPTURE 1
+            echo 'Поиск мимо туннеля включён: захват DNS запустится при следующем сборе (в течение минуты).'
+            echo 'Результаты: awg-monitor missed. Выключить и удалить данные: awg-monitor disable capture --purge'
+            cron_on || echo 'Внимание: задание cron выключено — включите: awg-monitor enable collect' ;;
+        *) die "Неизвестная функция '$1'. Доступно: collect, capture." ;;
+    esac
+}
+
+cmd_disable() {
+    what=${1:-}
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die 'Укажите: awg-monitor disable collect|capture [--purge]'
+    purge=0
+    if [ "$#" -eq 2 ]; then
+        [ "$2" = --purge ] || die "Неизвестный параметр '$2'."
+        purge=1
+    fi
+    [ "$(id -u)" = 0 ] || die 'Запустите под root в shell Entware.'
+    case $what in
+        collect)
+            [ "$purge" = 0 ] || die 'Для collect нет --purge: удалить всё — awg-monitor uninstall --purge'
+            WORK=$(mktemp -d /tmp/awg-monitor-install.XXXXXX)
+            trap 'rm -rf "$WORK"' 0
+            if [ -f "$CRONTAB" ]; then
+                update_crontab remove
+                [ ! -x "$CRON_INIT" ] || "$CRON_INIT" restart
+            fi
+            lock_wait
+            trap 'rm -rf "$WORK" "$LOCK"' 0
+            # Without collect nobody harvests or bounds the capture.
+            cap_clean
+            echo 'Сбор по cron выключен, захват DNS остановлен. Данные на диске сохранены.'
+            echo 'Включить снова: awg-monitor enable collect' ;;
+        capture)
+            lock_wait
+            trap 'rm -rf "$LOCK"' 0
+            if owned "$CONF"; then conf_set DNS_CAPTURE 0; fi
+            cap_clean
+            echo 'Поиск мимо туннеля выключен, tcpdump остановлен, данные в памяти удалены.'
+            if [ "$purge" = 1 ]; then
+                if logdir_ok; then
+                    rm -rf "$LOG_DIR/missed"
+                    rm -f "$LOG_DIR/missed.cache" "$LOG_DIR/missed.cache.tmp"
+                    echo "Удалены собранные данные: $LOG_DIR/missed, missed.cache"
+                else
+                    echo "Каталог логов недоступен — данные на диске не удалены."
+                fi
+            elif logdir_ok && [ -d "$LOG_DIR/missed" ]; then
+                echo "Собранные данные остались в $LOG_DIR/missed (удалить: awg-monitor disable capture --purge)"
+            fi
+            if opkg list-installed 2>/dev/null | grep -q '^tcpdump '; then
+                echo 'tcpdump больше не нужен монитору: opkg remove tcpdump'
+            fi ;;
+        *) die "Неизвестная функция '$what'. Доступно: collect, capture." ;;
+    esac
+}
+
 # ---------- commands ----------
 
 acquire_lock() {
@@ -997,13 +1189,10 @@ cmd_check() {
 }
 
 cmd_status() {
-    require_logdir
-    echo "Каталог логов: $LOG_DIR"
-    if grep -Fq "$MARKER" "$CRONTAB" 2>/dev/null; then
-        echo 'Сбор по cron: включён'
-    else
-        echo 'Сбор по cron: НЕ найден в crontab'
-    fi
+    show_components
+    logdir_ok || return 0
+    echo
+    echo '=== Туннель ==='
     read_state
     if [ -n "$P_state" ]; then
         echo "Текущее состояние: $P_state (причина: $P_cause), с $(date -d "@$P_since" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$P_since")"
@@ -1468,10 +1657,18 @@ cmd_uninstall() {
         update_crontab remove
         if [ -x "$CRON_INIT" ]; then "$CRON_INIT" restart; fi
     fi
+    lock_wait
+    trap 'rm -rf "$WORK" "$LOCK"' 0
+    cap_clean
     if owned "$BIN"; then rm -f "$BIN"; fi
     if owned "$CONF"; then rm -f "$CONF"; fi
-    cap_stop
-    rm -rf "$LOCK" "$NODIR_FLAG" "$DNS_MAP" "$CT_SEEN" "$CT_SEEN.tmp" "$INCLUDES" "$CAP_PID.missing"
+    if owned "$SRC_COPY"; then rm -f "$SRC_COPY"; fi
+    rm -f "$NODIR_FLAG"
+    if [ "$purge" = 1 ]; then
+        for f in "$CRONTAB".awg-monitor-backup.*; do
+            if [ -f "$f" ] && [ ! -L "$f" ]; then rm -f "$f"; fi
+        done
+    fi
     if logdir_ok; then
         if [ "$purge" = 1 ]; then
             rm -rf "$LOG_DIR/samples" "$LOG_DIR/domains" "$LOG_DIR/missed" "$LOG_DIR/dumps" "$LOG_DIR/snapshots" "$LOG_DIR/bundles"
@@ -1483,7 +1680,13 @@ cmd_uninstall() {
             echo "Логи сохранены: $LOG_DIR (удалить: uninstall --purge)"
         fi
     fi
-    echo 'awg-monitor удалён. Пакет cron и другие задания сохранены.'
+    echo 'awg-monitor удалён. Другие задания cron сохранены.'
+    left=$(ram_files | grep -v -e "^$LOCK\$" -e "^$WORK\$" || :)
+    [ -z "$left" ] || echo "Осталось в /tmp: $(echo $left)"
+    [ "$purge" = 1 ] || echo "Резервные копии crontab ($CRONTAB.awg-monitor-backup.*) сохранены — удаляются с --purge."
+    pk=$(pkg_list)
+    [ -z "$pk" ] || echo "Пакеты Entware не удалялись (могут быть нужны другим): $pk. Удалить ненужные: opkg remove ИМЯ"
+    echo 'Записи в системном журнале роутера (logger -t awg-monitor) остаются до его очистки/перезагрузки.'
 }
 
 ACTION=${1:-}
@@ -1491,6 +1694,8 @@ ACTION=${1:-}
 case $ACTION in
     install) cmd_install "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
+    enable) load_conf; cmd_enable "$@" ;;
+    disable) load_conf; cmd_disable "$@" ;;
     -h|--help|help|'') usage ;;
     collect|check|status|report|snapshot|snapshots|diff|bundle|check-domain|domains|route-check|missed)
         load_conf
