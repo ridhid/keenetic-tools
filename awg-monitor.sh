@@ -7,11 +7,21 @@ PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 BIN=/opt/bin/awg-monitor
+# Where the README one-liner downloads the installer.
+SRC_COPY=/opt/awg-monitor.sh
 CONF=/opt/etc/awg-monitor.conf
 CRONTAB=/opt/etc/crontab
 CRON_INIT=/opt/etc/init.d/S10cron
 LOCK=/tmp/awg-monitor.lock
 NODIR_FLAG=/tmp/awg-monitor.nodir
+# DNS capture for "missed" (RAM only).
+CAP_LOG=/tmp/awg-monitor.dns.log
+CAP_PID=/tmp/awg-monitor.dns.pid
+DNS_MAP=/tmp/awg-monitor.dnsmap
+CT_SEEN=/tmp/awg-monitor.ctseen
+INCLUDES=/tmp/awg-monitor.includes
+CAP_MAX=4194304
+DOH_IPS='8.8.8.8 8.8.4.4 1.1.1.1 1.0.0.1 9.9.9.9 149.112.112.112 94.140.14.14 94.140.15.15 208.67.222.222 208.67.220.220 77.88.8.8 77.88.8.1 76.76.2.0 76.76.10.0'
 MARKER='# keenetic-tools: awg-monitor'
 DIR_MARKER=.awg-monitor
 DEFAULT_LOG_DIR=/opt/var/log/awg-monitor
@@ -31,6 +41,16 @@ HANDSHAKE_STALE=180
 RTT_WARN=500
 CONFIG_EVERY=15
 KEEP_DAYS=14
+DOMAINS_WATCH=
+DOMAINS_EVERY=5
+DOMAIN_TIMEOUT=8
+WAN_IFACE=
+DNS_SERVER=127.0.0.1
+DNS_CAPTURE=0
+LAN_IFACE=br0
+MISSED_PROBES=3
+MISSED_RECHECK=24
+MISSED_STALL=1
 
 die() { echo "Ошибка: $*" >&2; exit 1; }
 syslog() { logger -t awg-monitor "$*" 2>/dev/null || :; }
@@ -40,14 +60,20 @@ usage() {
     cat <<'EOF'
 Использование:
   sh awg-monitor.sh install [--log-dir DIR]  — установить или обновить
-  awg-monitor uninstall [--purge]   — удалить; с --purge удалить и логи
+  awg-monitor uninstall [--purge]   — удалить; с --purge — все следы: логи, копии crontab, установщик
+  awg-monitor status                — что установлено, что запущено, сколько данных; состояние туннеля
+  awg-monitor enable collect|capture        — включить сбор по cron / поиск доменов мимо туннеля
+  awg-monitor disable collect|capture [--purge] — выключить и остановить; --purge удаляет данные функции
   awg-monitor check                 — замер прямо сейчас, ничего не записывает
-  awg-monitor status                — последний замер и последние события
   awg-monitor report [24h|7d]       — сводка за период (по умолчанию 24h)
   awg-monitor snapshot [метка]      — снять конфигурацию
   awg-monitor snapshots             — список снимков
   awg-monitor diff [A] [B]          — разница снимков (по умолчанию два последних)
   awg-monitor bundle [дней]         — архив логов для разбора (по умолчанию 3 дня)
+  awg-monitor check-domain ДОМЕН... — проверить домены напрямую и через туннель
+  awg-monitor domains [24h|7d]      — сводка проверок доменов из DOMAINS_WATCH
+  awg-monitor route-check ДОМЕН     — почему домен идёт (или не идёт) через туннель
+  awg-monitor missed [24h|7d]       — домены и соединения мимо туннеля без ответа (DNS_CAPTURE=1)
   awg-monitor collect               — один замер (его раз в минуту запускает cron)
 
 Каталог логов по умолчанию — из конфига, иначе /opt/var/log/awg-monitor.
@@ -362,6 +388,690 @@ write_dump() {
     echo "dumps/${f##*/}"
 }
 
+# ---------- domains ----------
+
+# Default-route device: the "direct" path for domain checks.
+wan_iface() {
+    if [ -n "$WAN_IFACE" ]; then
+        echo "$WAN_IFACE"
+        return 0
+    fi
+    ip -4 route show default 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+# Strips scheme, path and port; prints the lowercased host or fails on bad input.
+dom_norm() {
+    h=${1#*://}
+    h=${h%%/*}
+    h=${h%%:*}
+    case $h in ''|-*|.*|*[!A-Za-z0-9.-]*) return 1 ;; esac
+    echo "$h" | tr 'A-Z' 'a-z'
+}
+
+# HTTPS request to $1 bound to device $2; prints "stage code ip seconds".
+# Stage is "ok" when the server answered with any HTTP code, otherwise where it broke.
+dom_probe() {
+    out=$(curl -4 -s -o /dev/null --interface "$2" --max-time "$DOMAIN_TIMEOUT" \
+        -w '%{http_code} %{time_connect} %{time_appconnect} %{time_total} %{remote_ip}' \
+        "https://$1/" 2>/dev/null) && rc=0 || rc=$?
+    printf '%s %s\n' "$rc" "$out" | awk '{
+        rc = $1; code = ($2 == "" ? "000" : $2); tc = $3 + 0; ta = $4 + 0
+        if (code != "000") r = "ok"
+        else if (rc == 6) r = "dns"
+        else if (rc == 45) r = "iface"
+        else if (rc == 77) r = "ca"
+        else if (rc == 7) r = "tcp"
+        else if (rc == 35) r = "tls"
+        else if (rc == 51 || rc == 58 || rc == 60) r = "cert"
+        else if (tc == 0) r = "tcp"
+        else if (ta == 0) r = "tls"
+        else r = "http"
+        printf "%s %s %s %s\n", r, code, ($6 == "" ? "-" : $6), ($5 == "" ? "-" : sprintf("%.2f", $5)) }'
+}
+
+# Probes domains $2... via WAN and tunnel in parallel; results go to $1/N.wan and $1/N.tun.
+dom_run() {
+    dir=$1
+    shift
+    wan=$(wan_iface)
+    [ "$wan" != "$IFACE" ] || wan=
+    i=0
+    for d in "$@"; do
+        i=$((i + 1))
+        if [ -n "$wan" ]; then
+            dom_probe "$d" "$wan" > "$dir/$i.wan" &
+        else
+            echo 'nowan 000 - -' > "$dir/$i.wan"
+        fi
+        dom_probe "$d" "$IFACE" > "$dir/$i.tun" &
+    done
+    wait
+}
+
+# Reads results of domain number $2 from dir $1 into W_* and T_*.
+dom_read() {
+    W_r=err W_code=000 W_ip=- W_t=- T_r=err T_code=000 T_ip=- T_t=-
+    read -r W_r W_code W_ip W_t < "$1/$2.wan" || :
+    read -r T_r T_code T_ip T_t < "$1/$2.tun" || :
+}
+
+dom_ok() { case $1 in ok|nowan) echo ok ;; *) echo fail ;; esac; }
+
+dom_text() {
+    case $1 in
+        ok) echo "ответил, HTTP $2, $3 с" ;;
+        nowan) echo 'не проверено: не найден интерфейс провайдера (WAN_IFACE в конфиге)' ;;
+        dns) echo 'сбой DNS: имя не разрешилось' ;;
+        tcp) echo "сбой TCP: сервер не принял соединение ($3 с)" ;;
+        tls) echo "сбой TLS: рукопожатие оборвано или зависло ($3 с) — похоже на DPI" ;;
+        http) echo "сбой HTTP: соединение есть, ответа нет ($3 с)" ;;
+        cert) echo 'неверный сертификат — возможна подмена (заглушка провайдера)' ;;
+        ca) echo 'нет корневых сертификатов: opkg install ca-bundle' ;;
+        iface) echo 'интерфейс недоступен' ;;
+        *) echo "ошибка проверки ($1)" ;;
+    esac
+}
+
+dom_verdict() {
+    w=$(dom_ok "$1")
+    t=$(dom_ok "$2")
+    if [ "$1" = dns ] && [ "$2" = dns ]; then
+        echo 'имя не разрешается — проблема DNS (AdGuard Home / DNS роутера), а не маршрута'
+    elif [ "$1" = nowan ]; then
+        if [ "$t" = ok ]; then echo 'через туннель работает'; else echo 'через туннель не открывается'; fi
+    elif [ "$w" = ok ] && [ "$t" = ok ]; then
+        echo 'доступен обоими путями'
+    elif [ "$t" = ok ]; then
+        echo 'напрямую не открывается, через туннель — да: домен должен идти в туннель (проверьте список маршрутизации)'
+    elif [ "$w" = ok ]; then
+        echo 'через туннель не открывается, напрямую — да: проблема туннеля или его сервера'
+    else
+        echo 'не открывается ни напрямую, ни через туннель: сайт недоступен или блокировка глубже'
+    fi
+}
+
+# Domain checks from collect; temp files live in the lock dir.
+dom_collect() {
+    list=
+    for a in $DOMAINS_WATCH; do
+        if h=$(dom_norm "$a"); then list="$list $h"; fi
+    done
+    [ -n "$list" ] || return 0
+    dir="$LOCK/dom"
+    mkdir -p "$dir" "$LOG_DIR/domains"
+    # shellcheck disable=SC2086
+    dom_run "$dir" $list
+    st="$LOG_DIR/domains.state"
+    : > "$st.tmp"
+    i=0
+    for d in $list; do
+        i=$((i + 1))
+        dom_read "$dir" "$i"
+        ip=$W_ip
+        [ "$ip" != - ] || ip=$T_ip
+        echo "$STAMP ts=$NOW domain=$d wan=$W_r wan_code=$W_code wan_t=$W_t" \
+            "tun=$T_r tun_code=$T_code tun_t=$T_t ip=$ip" >> "$LOG_DIR/domains/$day.log"
+        flags="$(dom_ok "$W_r")/$(dom_ok "$T_r")"
+        old=$(awk -v d="$d" '$1 == d { print $2; exit }' "$st" 2>/dev/null || :)
+        if [ "$flags" != "${old:-ok/ok}" ]; then
+            event "domain_changed domain=$d wan=$W_r tun=$T_r"
+        fi
+        echo "$d $flags" >> "$st.tmp"
+    done
+    mv "$st.tmp" "$st"
+}
+
+# ---------- domain routing (Keenetic object-group fqdn) ----------
+
+tun_addr() {
+    ip -4 addr show dev "$IFACE" 2>/dev/null | awk '$1 == "inet" { sub(/\/.*/, "", $2); print $2; exit }'
+}
+
+# Prints "group include" for groups routed to $NDM_IFACE whose include covers domain $1.
+# Last line is "groups G1 G2..." with all such groups.
+dom_cover() {
+    ndmc -c 'show running-config' 2>/dev/null | awk -v d="$1" -v ifc="$NDM_IFACE" '
+        { sub(/\r$/, "") }
+        /^[^ !]/ { ing = 0; dp = 0 }
+        /^object-group fqdn / { g = $3; ing = 1; next }
+        /^dns-proxy$/ { dp = 1; next }
+        ing && $1 == "include" { inc[g] = inc[g] " " tolower($2) }
+        dp && $1 == "route" && $2 == "object-group" && $4 == ifc { r[$3] = 1 }
+        END {
+            for (g in r) {
+                gl = gl " " g
+                n = split(inc[g], a, " ")
+                for (i = 1; i <= n; i++)
+                    if (d == a[i] || (length(d) > length(a[i]) && substr(d, length(d) - length(a[i])) == "." a[i])) print g, a[i]
+            }
+            print "groups" gl
+        }'
+}
+
+# Resolves $1 via the router DNS (this also feeds Keenetic routing); prints addresses.
+dom_resolve() {
+    nslookup "$1" "$DNS_SERVER" 2>/dev/null | awk '
+        /^Name:/ { a = 1; next }
+        a && /^Address/ { sub(/^Address[ 0-9]*:[ \t]*/, ""); x = $1; if (x ~ /^[0-9.]+$/ || x ~ /:/) print x }'
+}
+
+# Conntrack flows from LAN to IPs in $1 (space-separated, empty = all public IPv4).
+# Prints "client dst proto dport via replied orig_bytes reply_bytes state".
+# Optional $3 = LAN CIDR: only clients from it. Column 10 is the client port.
+ct_flows() {
+    awk -v ips=" $1 " -v tun="$2" -v lan="${3:-}" '
+        function num(a,   x) { split(a, x, "."); return ((x[1] * 256 + x[2]) * 256 + x[3]) * 256 + x[4] }
+        BEGIN {
+            if (lan != "") { split(lan, l, "/"); bits = (l[2] == "" ? 32 : l[2]); div = 2 ^ (32 - bits); net = int(num(l[1]) / div) }
+        }
+        function priv(a) { return a ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.|22[4-9]\.|2[3-5][0-9]\.|0\.)/ }
+        $1 == "ipv4" {
+            split("", o); split("", r); st = "-"; unr = 0; side = 0
+            if ($3 == "tcp") st = $6
+            for (i = 4; i <= NF; i++) {
+                if ($i == "[UNREPLIED]") { unr = 1; continue }
+                p = index($i, "="); if (p < 2) continue
+                k = substr($i, 1, p - 1); v = substr($i, p + 1)
+                if (k == "src") side++
+                if (side == 1 && !(k in o)) o[k] = v
+                else if (side == 2 && !(k in r)) r[k] = v
+            }
+            if (!priv(o["src"]) || priv(o["dst"])) next
+            if (lan != "" && int(num(o["src"]) / div) != net) next
+            if (ips != "  " && index(ips, " " o["dst"] " ") == 0) next
+            via = (tun != "" && r["dst"] == tun) ? "tun" : "wan"
+            print o["src"], o["dst"], $3, (o["dport"] == "" ? "-" : o["dport"]), via, (unr ? "no" : "yes"),
+                (o["bytes"] == "" ? "-" : o["bytes"]), (r["bytes"] == "" ? "-" : r["bytes"]), st,
+                (o["sport"] == "" ? "-" : o["sport"])
+        }' /proc/net/nf_conntrack 2>/dev/null
+}
+
+# Counts LAN IPv6 flows to global addresses (they bypass an IPv4-only tunnel).
+ct_v6_count() {
+    awk '$1 == "ipv6" {
+            for (i = 4; i <= NF; i++) if ($i ~ /^dst=/) { d = substr($i, 5); break }
+            if (d !~ /^f[ef]/ && d !~ /^0000/) n++
+        } END { print n + 0 }' /proc/net/nf_conntrack 2>/dev/null
+}
+
+cmd_route_check() {
+    [ "$#" -eq 1 ] || die 'Укажите один домен: awg-monitor route-check example.com'
+    d=$(dom_norm "$1") || die "Некорректный домен: '$1'."
+    command -v ndmc >/dev/null 2>&1 || die 'ndmc не найден — команда работает только на Keenetic.'
+    cover=$(dom_cover "$d")
+    groups=$(printf '%s\n' "$cover" | sed -n 's/^groups *//p')
+    hit=$(printf '%s\n' "$cover" | grep -v '^groups' | head -n 1 || :)
+    echo "Домен: $d"
+    if [ -z "$groups" ]; then
+        echo "1. Список: не найдено групп с маршрутом в $NDM_IFACE (dns-proxy route object-group ... $NDM_IFACE)."
+    elif [ -n "$hit" ]; then
+        echo "1. Список: покрыт — группа ${hit%% *}, запись include ${hit#* }"
+    else
+        echo "1. Список: НЕ покрыт ни одной группой ($groups) — трафик пойдёт мимо туннеля."
+    fi
+
+    addrs=$(dom_resolve "$d" | tr '\n' ' ')
+    v4=$(printf '%s\n' $addrs | grep -E '^[0-9.]+$' | tr '\n' ' ' || :)
+    v6=$(printf '%s\n' $addrs | grep : | tr '\n' ' ' || :)
+    if [ -n "$v4$v6" ]; then
+        echo "2. DNS роутера ($DNS_SERVER): IPv4: ${v4:-нет}; IPv6: ${v6:-нет}"
+    else
+        echo "2. DNS роутера ($DNS_SERVER): имя не разрешилось."
+    fi
+
+    missing=
+    if [ -n "$hit" ] && [ -n "$v4" ]; then
+        g=${hit%% *}
+        # Give ndnproxy a moment to apply the answer to the runtime list.
+        sleep 1
+        listed=$(ndmc -c "show object-group fqdn $g" 2>/dev/null | awk '
+            $1 == "fqdn:" { f = $2 } $1 == "address:" { print $2, f }')
+        for ip in $v4; do
+            f=$(printf '%s\n' "$listed" | awk -v ip="$ip" '$1 == ip { print $2; exit }')
+            if [ -n "$f" ]; then
+                echo "3. $ip — в runtime-списке группы $g (как $f)"
+            else
+                echo "3. $ip — НЕТ в runtime-списке группы $g"
+                missing="$missing $ip"
+            fi
+        done
+    fi
+
+    tun=$(tun_addr)
+    flows=
+    [ -z "$v4" ] || flows=$(ct_flows "$v4" "$tun")
+    if [ -z "$v4" ]; then
+        echo '4. Соединения: нечего проверять — нет IPv4-адресов.'
+    elif [ -n "$flows" ]; then
+        echo "4. Текущие соединения устройств к этим IP (адрес туннеля ${tun:-?}):"
+        printf '%s\n' "$flows" | awk '{
+            printf "   %s -> %s %s/%s через %s, ответ %s, байт %s/%s%s\n", $1, $2, $3, $4,
+                ($5 == "tun" ? "ТУННЕЛЬ" : "ПРОВАЙДЕРА"), ($6 == "yes" ? "есть" : "НЕТ"), $7, $8, ($9 == "-" ? "" : ", " $9) }'
+    else
+        echo '4. Текущих соединений устройств к этим IP нет (откройте сайт на устройстве и повторите).'
+    fi
+    wan_n=$(printf '%s\n' "$flows" | awk '$5 == "wan"' | grep -c . || :)
+
+    if command -v curl >/dev/null 2>&1; then
+        WORK=$(mktemp -d /tmp/awg-monitor-dom.XXXXXX)
+        trap 'rm -rf "$WORK"' 0
+        dom_run "$WORK" "$d"
+        dom_read "$WORK" 1
+        echo "5. Проверка с роутера: напрямую — $(dom_text "$W_r" "$W_code" "$W_t"); туннель — $(dom_text "$T_r" "$T_code" "$T_t")"
+    fi
+
+    v6n=$(ct_v6_count)
+    echo
+    echo 'Итог:'
+    if [ -n "$groups" ] && [ -z "$hit" ]; then
+        base=$(echo "$d" | awk -F. 'NF > 2 { print $(NF - 1) "." $NF; next } { print }')
+        if [ "$base" = "$d" ]; then
+            echo "  Домен не в списке. Добавьте в группу: include $d"
+        else
+            echo "  Домен не в списке. Добавьте в группу: include $base (или $d)."
+        fi
+    fi
+    [ -z "$missing" ] || echo "  IP$missing не попали в список: проверьте, что устройство спрашивает DNS роутера."
+    if [ -n "$hit" ] && [ "$wan_n" -gt 0 ]; then
+        echo '  Домен в списке, но соединения идут мимо туннеля: устройство получило IP раньше (кэш DNS —'
+        echo '  переподключите устройство / ipconfig /flushdns) или берёт его из своего DNS (DoH, Private DNS).'
+    fi
+    if [ -n "$v6" ] && [ "$v6n" -gt 0 ]; then
+        echo "  У домена есть IPv6, а в сети $v6n IPv6-соединений в интернет: туннель только IPv4,"
+        echo '  такой трафик идёт мимо. Отключите IPv6 в домашней сети или для этих устройств.'
+    fi
+    echo '  Шаг 4 видит только IP, полученные с роутера сейчас; у CDN устройство могло получить другие.'
+}
+
+# ---------- missed: flows that bypass the tunnel ----------
+
+cap_running() {
+    p=$(cat "$CAP_PID" 2>/dev/null || :)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && grep -q tcpdump "/proc/$p/cmdline" 2>/dev/null
+}
+
+cap_stop() {
+    if cap_running; then kill "$(cat "$CAP_PID")" 2>/dev/null || :; fi
+    rm -f "$CAP_PID" "$CAP_LOG" "$CAP_LOG.work"
+}
+
+# Keeps tcpdump capturing DNS answers to LAN clients. -c bounds RAM if collect stops.
+cap_ensure() {
+    if cap_running; then
+        if [ "$(wc -c < "$CAP_LOG" 2>/dev/null || echo 0)" -le "$CAP_MAX" ]; then return 0; fi
+        cap_stop
+        syslog 'захват DNS: файл вырос сверх лимита, перезапуск'
+    fi
+    # Append mode: after truncation tcpdump keeps writing from the start.
+    tcpdump -l -n -t -vv -s 1500 -c 20000 -i "$LAN_IFACE" 'udp src port 53' \
+        >> "$CAP_LOG" 2>/dev/null < /dev/null &
+    echo $! > "$CAP_PID"
+}
+
+lan_cidr() {
+    ip -4 addr show dev "$LAN_IFACE" 2>/dev/null | awk '$1 == "inet" { print $2; exit }'
+}
+
+# Tunnel group includes, one per line; refreshed every 10 minutes.
+includes_refresh() {
+    if [ -s "$INCLUDES" ] && [ $((MIN % 10)) -ne 0 ]; then return 0; fi
+    ndmc -c 'show running-config' 2>/dev/null | awk -v ifc="$NDM_IFACE" '
+        { sub(/\r$/, "") }
+        /^[^ !]/ { ing = 0; dp = 0 }
+        /^object-group fqdn / { g = $3; ing = 1; next }
+        /^dns-proxy$/ { dp = 1; next }
+        ing && $1 == "include" { inc[g] = inc[g] " " tolower($2) }
+        dp && $1 == "route" && $2 == "object-group" && $4 == ifc { r[$3] = 1 }
+        END { for (g in r) { n = split(inc[g], a, " "); for (i = 1; i <= n; i++) print a[i] } }' > "$INCLUDES.tmp" || :
+    mv "$INCLUDES.tmp" "$INCLUDES"
+}
+
+# Moves captured answers into $DNS_MAP: "ts ip domain client", latest per IP, last 6 hours.
+dns_harvest() {
+    touch "$DNS_MAP"
+    [ -s "$CAP_LOG" ] || return 0
+    cp "$CAP_LOG" "$CAP_LOG.work"
+    : > "$CAP_LOG"
+    {
+        cat "$DNS_MAP"
+        awk -v now="$NOW" '/ q: / {
+            c = ""; qn = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == ">" && c == "") { c = $(i + 1); sub(/:$/, "", c); sub(/\.[0-9]+$/, "", c) }
+                if ($i == "q:") { if ($(i + 1) != "A?") next; qn = tolower($(i + 2)); sub(/\.$/, "", qn); q = i + 3; break }
+            }
+            if (qn == "") next
+            for (j = q; j < NF; j++) if ($j == "A") { a = $(j + 1); sub(/,$/, "", a); print now, a, qn, c }
+        }' "$CAP_LOG.work"
+    } | awk -v from="$((NOW - 21600))" '$1 >= from { t[$2] = $1; d[$2] = $3; c[$2] = $4 }
+        END { for (k in t) print t[k], k, d[k], c[k] }' > "$DNS_MAP.tmp"
+    mv "$DNS_MAP.tmp" "$DNS_MAP"
+    rm -f "$CAP_LOG.work"
+}
+
+# One minute of conntrack: logs new failed/suspicious LAN flows, then probes new domains.
+missed_collect() {
+    if ! command -v tcpdump >/dev/null 2>&1; then
+        if [ ! -f "$CAP_PID.missing" ]; then
+            : > "$CAP_PID.missing"
+            syslog 'DNS_CAPTURE=1, но tcpdump не установлен: opkg install tcpdump'
+        fi
+        return 0
+    fi
+    rm -f "$CAP_PID.missing"
+    cap_ensure
+    dns_harvest
+    includes_refresh
+    touch "$CT_SEEN"
+    mkdir -p "$LOG_DIR/missed"
+    out="$LOG_DIR/missed/$day.log"
+    flows="$LOCK/flows"
+    ct_flows '' "$(tun_addr)" "$(lan_cidr)" > "$flows"
+    awk -v stamp="$STAMP" -v now="$NOW" -v stall="$MISSED_STALL" -v dohs=" $DOH_IPS " \
+        -v seen_out="$CT_SEEN.tmp" -v new_out="$LOCK/new" '
+        function covered(d,   p) {
+            while (d != "") { if (d in inc) return "yes"; p = index(d, "."); if (!p) break; d = substr(d, p + 1) }
+            return "no"
+        }
+        FILENAME == ARGV[1] { dom[$2] = $3; next }
+        FILENAME == ARGV[2] { inc[$1] = 1; next }
+        FILENAME == ARGV[3] { seen[$1] = 1; next }
+        {
+            stage = ""
+            if ($4 == 853) stage = "dot"
+            else if ($4 == 443 && index(dohs, " " $2 " ")) stage = "doh"
+            else if ($6 == "no") stage = ($3 == "udp" ? "noreply_udp" : "noreply")
+            else if (stall == 1 && $3 == "tcp" && $9 == "ESTABLISHED" && $4 == 443 && $7 + 0 >= 600 && $8 + 0 < 400) stage = "stall"
+            if (stage == "") next
+            key = $1 ":" $10 ">" $2 ":" $4 "/" $3
+            print key > seen_out
+            if (key in seen) next
+            d = ($2 in dom) ? dom[$2] : "-"
+            cov = (d == "-") ? "-" : covered(d)
+            print stamp " ts=" now " kind=flow client=" $1 " ip=" $2 " proto=" $3 " dport=" $4 " via=" $5 \
+                " stage=" stage " domain=" d " covered=" cov
+            if ($5 == "wan" && cov == "no" && stage != "doh" && stage != "dot") print d > new_out
+        }' "$DNS_MAP" "$INCLUDES" "$CT_SEEN" "$flows" >> "$out"
+    touch "$CT_SEEN.tmp"
+    mv "$CT_SEEN.tmp" "$CT_SEEN"
+
+    [ -s "$LOCK/new" ] && is_num "$MISSED_PROBES" && [ "$MISSED_PROBES" -gt 0 ] || return 0
+    cache="$LOG_DIR/missed.cache"
+    touch "$cache"
+    list=$(sort -u "$LOCK/new" | awk -v from="$((NOW - MISSED_RECHECK * 3600))" -v max="$MISSED_PROBES" '
+        FILENAME == ARGV[1] { if ($2 >= from) fresh[$1] = 1; next }
+        !($1 in fresh) && n < max { print; n++ }' "$cache" -)
+    [ -n "$list" ] || return 0
+    mkdir -p "$LOCK/probe"
+    # shellcheck disable=SC2086
+    dom_run "$LOCK/probe" $list
+    i=0
+    for d in $list; do
+        i=$((i + 1))
+        dom_read "$LOCK/probe" "$i"
+        echo "$STAMP ts=$NOW kind=probe domain=$d wan=$W_r wan_t=$W_t tun=$T_r tun_t=$T_t" >> "$out"
+        echo "$d $NOW $W_r $T_r" >> "$cache"
+        if [ "$(dom_ok "$W_r")" = fail ] && [ "$T_r" = ok ]; then
+            event "missed_candidate domain=$d wan=$W_r tun=ok"
+        fi
+    done
+    # Keep only the newest entry per domain.
+    awk '{ l[$1] = $0 } END { for (k in l) print l[k] }' "$cache" > "$cache.tmp"
+    mv "$cache.tmp" "$cache"
+}
+
+cmd_missed() {
+    require_logdir
+    parse_period "${1:-}"
+    set -- "$LOG_DIR"/missed/*.log
+    if [ ! -e "$1" ]; then
+        [ "$DNS_CAPTURE" = 1 ] || die 'Сбор выключен. Включите: opkg install tcpdump, затем DNS_CAPTURE=1 в /opt/etc/awg-monitor.conf.'
+        die 'Данных пока нет — подождите несколько минут.'
+    fi
+    cat "$@" | awk -v from="$from" -v to="$now" -v period="$period" '
+        function kv(   i, p) {
+            split("", f)
+            for (i = 3; i <= NF; i++) { p = index($i, "="); if (p > 1) f[substr($i, 1, p - 1)] = substr($i, p + 1) }
+        }
+        function add(arr, k, v) { if (index(" " arr[k] " ", " " v " ") == 0) arr[k] = arr[k] (arr[k] == "" ? "" : " ") v }
+        function nwords(s,   x) { return split(s, x, " ") }
+        function base(d,   x, n) { n = split(d, x, "."); return n > 2 ? x[n - 1] "." x[n] : d }
+        # Prints keys of cnt sorted by count, at most max.
+        function top(cnt, max, title, extra,   k, i, j, n, ks, t, shown) {
+            n = 0; for (k in cnt) ks[++n] = k
+            for (i = 2; i <= n; i++) { t = ks[i]; for (j = i - 1; j > 0 && cnt[ks[j]] < cnt[t]; j--) ks[j + 1] = ks[j]; ks[j + 1] = t }
+            if (!n) return 0
+            print "\n" title
+            for (i = 1; i <= n && i <= max; i++) printf "  %-40s соединений %d, устройства: %s%s\n", ks[i], cnt[ks[i]], cl[ks[i]], (extra ? extra_of(ks[i]) : "")
+            if (n > max) printf "  … и ещё %d\n", n - max
+            return n
+        }
+        function extra_of(k) { return (k in pr) ? "; проверка: напрямую " pr[k] ", туннель " pt[k] : "" }
+        {
+            kv(); ts = f["ts"] + 0
+            if (ts < from || ts > to) next
+            if (f["kind"] == "probe") { pr[f["domain"]] = f["wan"]; pt[f["domain"]] = f["tun"]; next }
+            if (f["kind"] != "flow") next
+            st = f["stage"]; d = f["domain"]; c = f["client"]; v = f["via"]
+            if (st == "doh" || st == "dot") { dc[c]++; add(dip, c, f["ip"] ":" f["dport"]); next }
+            if (v == "tun") { k = (d == "-" ? f["ip"] : d); tc[k]++; add(cl, k, c); next }
+            if (d == "-") { k = f["ip"] ":" f["dport"] "/" f["proto"]; nd[k]++; add(cl, k, c); next }
+            add(cl, d, c); add(stg, d, st)
+            if (f["covered"] == "yes") cv[d]++; else un[d]++
+        }
+        END {
+            print "Период " period "."
+            n = 0
+            for (d in un) if ((d in pr) && pr[d] != "ok" && pr[d] != "nowan" && pt[d] == "ok") { cand[d] = un[d]; n++; add(bases, "x", base(d)) }
+            any = n
+            top(cand, 50, "1. Не в списке, напрямую не открываются, через туннель — да (добавить в список):", 0)
+            if (n) {
+                print "   Предлагается добавить в группу:"
+                k = split(bases["x"], b, " "); for (i = 1; i <= k; i++) print "     include " b[i]
+            }
+            for (d in un) if (!(d in cand)) rest[d] = un[d]
+            any += top(rest, 30, "2. Не в списке, соединения мимо туннеля без ответа (не подтверждено проверкой):", 1)
+            any += top(cv, 30, "3. В списке, но соединения пошли мимо туннеля (кэш DNS на устройстве, DoH, IPv6):", 0)
+            any += top(nd, 20, "4. Без ответа и без запроса к DNS роутера (DoH на устройстве или вшитые IP):", 0)
+            for (c in dc) { printf "%s", (hdr++ ? "" : "\n5. Устройства со своим DNS (DoH/DoT) — их домены роутер не видит:\n"); printf "  %s — соединений %d: %s\n", c, dc[c], dip[c] }
+            any += top(tc, 10, "6. Через туннель без ответа (проблема туннеля или сервера):", 0)
+            if (!any && !hdr) print "Соединений мимо туннеля без ответа не найдено."
+        }'
+    if [ "$DNS_CAPTURE" = 1 ] && ! cap_running; then
+        echo
+        echo 'Внимание: захват DNS сейчас не запущен (появится в течение минуты; нужен tcpdump).'
+    fi
+}
+
+# ---------- components: status / enable / disable ----------
+
+cron_on() { grep -Fq "$MARKER" "$CRONTAB" 2>/dev/null; }
+
+# Waits for a running collect to finish, then holds the lock until exit.
+lock_wait() {
+    n=0
+    until acquire_lock; do
+        n=$((n + 1))
+        [ "$n" -lt 90 ] || die "Сбор (collect) не завершается: занят $LOCK."
+        sleep 1
+    done
+}
+
+ram_files() {
+    for f in /tmp/awg-monitor*; do
+        if [ -e "$f" ]; then echo "$f"; fi
+    done
+}
+
+# Removes RAM state of the DNS capture; tcpdump must already be stopped.
+cap_clean() {
+    cap_stop
+    rm -f "$DNS_MAP" "$DNS_MAP.tmp" "$CT_SEEN" "$CT_SEEN.tmp" "$INCLUDES" "$INCLUDES.tmp" "$CAP_PID.missing"
+}
+
+conf_set() {
+    owned "$CONF" || die "Нет $CONF — сначала установите: sh awg-monitor.sh install"
+    awk -v k="$1" -v v="$2" 'index($0, k "=") == 1 { print k "=" v; done = 1; next } { print }
+        END { if (!done) print k "=" v }' "$CONF" > "$CONF.tmp.$$"
+    mv "$CONF.tmp.$$" "$CONF"
+}
+
+size_of() {
+    if [ -e "$1" ]; then du -sh "$1" 2>/dev/null | awk '{ print $1 }'; else echo '-'; fi
+}
+
+pkg_list() {
+    opkg list-installed 2>/dev/null | awk '$1 == "cron" || $1 == "curl" || $1 == "ca-bundle" || $1 == "tcpdump" { printf "%s%s", (n++ ? ", " : ""), $1 }'
+}
+
+row() { echo "  $1: $2"; }
+
+show_components() {
+    echo 'Установлено:'
+    if owned "$BIN"; then row 'скрипт' "$BIN"; else row 'скрипт' 'нет'; fi
+    if owned "$CONF"; then row 'настройки' "$CONF"; else row 'настройки' 'нет'; fi
+    if owned "$SRC_COPY"; then row 'копия установщика' "$SRC_COPY (не нужна после установки)"; fi
+    if cron_on; then row 'задание cron (раз в минуту)' 'ВКЛЮЧЕНО'; else row 'задание cron (раз в минуту)' 'выключено'; fi
+    n=0
+    for f in "$CRONTAB".awg-monitor-backup.*; do
+        if [ -f "$f" ]; then n=$((n + 1)); fi
+    done
+    [ "$n" -eq 0 ] || row 'резервные копии crontab' "$n шт. ($CRONTAB.awg-monitor-backup.*)"
+
+    echo
+    echo 'Запущено сейчас:'
+    p=$(cat "$LOCK/pid" 2>/dev/null || :)
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then row 'сбор (collect)' "выполняется, PID $p"; else row 'сбор (collect)' 'не выполняется'; fi
+    if cap_running; then row 'захват DNS (tcpdump)' "ЗАПУЩЕН, PID $(cat "$CAP_PID")"; else row 'захват DNS (tcpdump)' 'не запущен'; fi
+
+    echo
+    echo 'Функции:'
+    if cron_on; then row 'замеры туннеля' 'включены'; else row 'замеры туннеля' 'выключены (нет задания cron)'; fi
+    set -- $DOMAINS_WATCH
+    if [ "$#" -gt 0 ]; then row 'проверка DOMAINS_WATCH' "$# доменов, раз в $DOMAINS_EVERY мин"; else row 'проверка DOMAINS_WATCH' 'выключена (список пуст)'; fi
+    if [ "$DNS_CAPTURE" = 1 ]; then
+        t='ВКЛЮЧЁН'
+        command -v tcpdump >/dev/null 2>&1 || t="$t, но tcpdump не установлен"
+        cron_on || t="$t, но задание cron выключено"
+        row 'поиск мимо туннеля (capture)' "$t"
+    else
+        row 'поиск мимо туннеля (capture)' 'выключен'
+    fi
+
+    echo
+    echo 'Данные:'
+    if logdir_ok; then
+        row 'каталог логов' "$LOG_DIR ($(size_of "$LOG_DIR"))"
+        for d in samples domains missed dumps snapshots bundles; do
+            [ -e "$LOG_DIR/$d" ] && echo "    $d ($(size_of "$LOG_DIR/$d"))"
+        done
+    elif [ -n "$LOG_DIR" ]; then
+        row 'каталог логов' "$LOG_DIR — недоступен (диск не подключён или удалён)"
+    else
+        row 'каталог логов' 'не задан'
+    fi
+    ram=$(ram_files)
+    if [ -n "$ram" ]; then
+        row 'в памяти (/tmp)' ''
+        for f in $ram; do echo "    $f ($(size_of "$f"))"; done
+    else
+        row 'в памяти (/tmp)' 'ничего'
+    fi
+    pk=$(pkg_list)
+    row 'пакеты Entware' "${pk:-нет} (удаляются только вручную: opkg remove ...)"
+
+    echo
+    echo 'Управление:'
+    if ! owned "$BIN" && ! owned "$CONF" && ! cron_on && ! cap_running && [ -z "$ram" ]; then
+        echo '  awg-monitor не установлен и ничего не запущено.'
+        echo '  Установить: sh awg-monitor.sh install --log-dir DIR'
+        return 0
+    fi
+    if [ "$DNS_CAPTURE" = 1 ] || cap_running; then
+        echo '  awg-monitor disable capture --purge   — остановить поиск мимо туннеля и удалить его данные'
+    else
+        echo '  awg-monitor enable capture            — включить поиск мимо туннеля (нужен tcpdump)'
+    fi
+    if cron_on; then
+        echo '  awg-monitor disable collect           — выключить весь сбор (cron), данные остаются'
+    elif owned "$BIN"; then
+        echo '  awg-monitor enable collect            — включить сбор по cron'
+    fi
+    echo '  awg-monitor uninstall --purge         — удалить всё и все следы'
+}
+
+cmd_enable() {
+    [ "$#" -eq 1 ] || die 'Укажите: awg-monitor enable collect|capture'
+    [ "$(id -u)" = 0 ] || die 'Запустите под root в shell Entware.'
+    owned "$BIN" || die "awg-monitor не установлен ($BIN). Установите: sh awg-monitor.sh install"
+    case $1 in
+        collect)
+            WORK=$(mktemp -d /tmp/awg-monitor-install.XXXXXX)
+            trap 'rm -rf "$WORK"' 0
+            [ -f "$CRONTAB" ] || die "Не найден $CRONTAB."
+            update_crontab add
+            "$CRON_INIT" restart
+            echo 'Сбор по cron включён (раз в минуту).' ;;
+        capture)
+            command -v tcpdump >/dev/null 2>&1 || die 'Нужен tcpdump: opkg install tcpdump'
+            require_logdir
+            conf_set DNS_CAPTURE 1
+            echo 'Поиск мимо туннеля включён: захват DNS запустится при следующем сборе (в течение минуты).'
+            echo 'Результаты: awg-monitor missed. Выключить и удалить данные: awg-monitor disable capture --purge'
+            cron_on || echo 'Внимание: задание cron выключено — включите: awg-monitor enable collect' ;;
+        *) die "Неизвестная функция '$1'. Доступно: collect, capture." ;;
+    esac
+}
+
+cmd_disable() {
+    what=${1:-}
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die 'Укажите: awg-monitor disable collect|capture [--purge]'
+    purge=0
+    if [ "$#" -eq 2 ]; then
+        [ "$2" = --purge ] || die "Неизвестный параметр '$2'."
+        purge=1
+    fi
+    [ "$(id -u)" = 0 ] || die 'Запустите под root в shell Entware.'
+    case $what in
+        collect)
+            [ "$purge" = 0 ] || die 'Для collect нет --purge: удалить всё — awg-monitor uninstall --purge'
+            WORK=$(mktemp -d /tmp/awg-monitor-install.XXXXXX)
+            trap 'rm -rf "$WORK"' 0
+            if [ -f "$CRONTAB" ]; then
+                update_crontab remove
+                [ ! -x "$CRON_INIT" ] || "$CRON_INIT" restart
+            fi
+            lock_wait
+            trap 'rm -rf "$WORK" "$LOCK"' 0
+            # Without collect nobody harvests or bounds the capture.
+            cap_clean
+            echo 'Сбор по cron выключен, захват DNS остановлен. Данные на диске сохранены.'
+            echo 'Включить снова: awg-monitor enable collect' ;;
+        capture)
+            lock_wait
+            trap 'rm -rf "$LOCK"' 0
+            if owned "$CONF"; then conf_set DNS_CAPTURE 0; fi
+            cap_clean
+            echo 'Поиск мимо туннеля выключен, tcpdump остановлен, данные в памяти удалены.'
+            if [ "$purge" = 1 ]; then
+                if logdir_ok; then
+                    rm -rf "$LOG_DIR/missed"
+                    rm -f "$LOG_DIR/missed.cache" "$LOG_DIR/missed.cache.tmp"
+                    echo "Удалены собранные данные: $LOG_DIR/missed, missed.cache"
+                else
+                    echo "Каталог логов недоступен — данные на диске не удалены."
+                fi
+            elif logdir_ok && [ -d "$LOG_DIR/missed" ]; then
+                echo "Собранные данные остались в $LOG_DIR/missed (удалить: awg-monitor disable capture --purge)"
+            fi
+            if opkg list-installed 2>/dev/null | grep -q '^tcpdump '; then
+                echo 'tcpdump больше не нужен монитору: opkg remove tcpdump'
+            fi ;;
+        *) die "Неизвестная функция '$what'. Доступно: collect, capture." ;;
+    esac
+}
+
 # ---------- commands ----------
 
 acquire_lock() {
@@ -381,6 +1091,7 @@ acquire_lock() {
 cmd_collect() {
     if ! logdir_ok; then
         # Disk missing: do not write into an empty mount point; warn once.
+        cap_stop
         if [ ! -f "$NODIR_FLAG" ]; then
             : > "$NODIR_FLAG"
             syslog "каталог логов '${LOG_DIR:-не задан}' недоступен, замеры не пишутся"
@@ -430,9 +1141,20 @@ cmd_collect() {
         fi
     fi
 
+    if [ "$DNS_CAPTURE" = 1 ]; then
+        missed_collect
+    elif [ -f "$CAP_PID" ]; then
+        cap_stop
+    fi
+
+    if [ -n "$DOMAINS_WATCH" ] && is_num "$DOMAINS_EVERY" && [ "$DOMAINS_EVERY" -gt 0 ] &&
+        [ $((MIN % DOMAINS_EVERY)) -eq 0 ] && command -v curl >/dev/null 2>&1; then
+        dom_collect
+    fi
+
     # Housekeeping once a day.
     if ! is_num "$P_ts" || [ "$(date -d "@$P_ts" +%Y-%m-%d 2>/dev/null)" != "$day" ]; then
-        for d in samples dumps bundles; do
+        for d in samples domains missed dumps bundles; do
             [ -d "$LOG_DIR/$d" ] &&
                 find "$LOG_DIR/$d" -type f -mtime +"$KEEP_DAYS" -exec rm -f {} \; 2>/dev/null || :
         done
@@ -467,13 +1189,10 @@ cmd_check() {
 }
 
 cmd_status() {
-    require_logdir
-    echo "Каталог логов: $LOG_DIR"
-    if grep -Fq "$MARKER" "$CRONTAB" 2>/dev/null; then
-        echo 'Сбор по cron: включён'
-    else
-        echo 'Сбор по cron: НЕ найден в crontab'
-    fi
+    show_components
+    logdir_ok || return 0
+    echo
+    echo '=== Туннель ==='
     read_state
     if [ -n "$P_state" ]; then
         echo "Текущее состояние: $P_state (причина: $P_cause), с $(date -d "@$P_since" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$P_since")"
@@ -492,8 +1211,8 @@ cmd_status() {
     fi
 }
 
-cmd_report() {
-    require_logdir
+# Parses period $1 (24h, 7d); sets period, now, from.
+parse_period() {
     period=${1:-24h}
     case $period in
         *h) n=${period%h} mult=3600 ;;
@@ -503,6 +1222,11 @@ cmd_report() {
     is_num "$n" && [ "$n" -gt 0 ] || die "Период задаётся как 24h или 7d."
     now=$(date +%s)
     from=$((now - n * mult))
+}
+
+cmd_report() {
+    require_logdir
+    parse_period "${1:-}"
     set -- "$LOG_DIR"/samples/*.log
     [ -e "$1" ] || die "Замеров пока нет. Первый появится в течение минуты после установки."
     cat "$@" | awk -v from="$from" -v to="$now" -v period="$period" '
@@ -567,6 +1291,79 @@ cmd_report() {
                 if (ep) printf "\nСмена Endpoint: %d%s\n", ep, el
                 if (cf) printf "\nИзменения конфигурации: %d%s\n(сравнить: awg-monitor diff)\n", cf, cl
             }' "$LOG_DIR/events.log" 2>/dev/null
+    fi
+}
+
+cmd_check_domain() {
+    [ "$#" -gt 0 ] || die 'Укажите домен: awg-monitor check-domain example.com'
+    command -v curl >/dev/null 2>&1 || die 'Нужен curl: opkg install curl ca-bundle'
+    list=
+    for a in "$@"; do
+        h=$(dom_norm "$a") || die "Некорректный домен: '$a'."
+        list="$list $h"
+    done
+    WORK=$(mktemp -d /tmp/awg-monitor-dom.XXXXXX)
+    trap 'rm -rf "$WORK"' 0
+    # shellcheck disable=SC2086
+    dom_run "$WORK" $list
+    echo "Напрямую — через ${wan:-?}, туннель — через $IFACE; таймаут $DOMAIN_TIMEOUT с."
+    i=0
+    for d in $list; do
+        i=$((i + 1))
+        dom_read "$WORK" "$i"
+        echo
+        ip=$W_ip
+        [ "$ip" != - ] || ip=$T_ip
+        if [ "$ip" != - ]; then echo "$d ($ip)"; else echo "$d"; fi
+        echo "  напрямую: $(dom_text "$W_r" "$W_code" "$W_t")"
+        echo "  туннель:  $(dom_text "$T_r" "$T_code" "$T_t")"
+        echo "  итог: $(dom_verdict "$W_r" "$T_r")"
+    done
+}
+
+cmd_domains() {
+    require_logdir
+    parse_period "${1:-}"
+    set -- "$LOG_DIR"/domains/*.log
+    [ -e "$1" ] || die 'Проверок доменов пока нет. Задайте DOMAINS_WATCH в /opt/etc/awg-monitor.conf.'
+    cat "$@" | awk -v from="$from" -v to="$now" -v period="$period" '
+        function kv(   i, p) {
+            split("", f)
+            for (i = 3; i <= NF; i++) { p = index($i, "="); if (p > 1) f[substr($i, 1, p - 1)] = substr($i, p + 1) }
+        }
+        function stages(d, side,   s, i, k, out) {
+            split("dns tcp tls http cert ca iface err", s, " ")
+            for (i = 1; i in s; i++) { k = d SUBSEP side SUBSEP s[i]; if (k in fail) out = out (out ? ", " : "") s[i] " " fail[k] }
+            return out
+        }
+        function pct(ok, total) { return total ? sprintf("%.0f%%", 100 * ok / total) : "-" }
+        {
+            kv(); ts = f["ts"] + 0
+            if (ts < from || ts > to) next
+            d = f["domain"]; if (d == "") next
+            if (!(d in n)) ord[++nd] = d
+            n[d]++; w = f["wan"]; t = f["tun"]
+            if (w != "nowan") { wn[d]++; if (w == "ok") wok[d]++; else fail[d, "w", w]++ }
+            if (t == "ok") tok[d]++; else fail[d, "t", t]++
+            last[d] = $1 " " substr($2, 1, 5) " напрямую=" w " туннель=" t
+        }
+        END {
+            if (!nd) { print "За период " period " проверок доменов нет."; exit }
+            print "Период " period ", доля успешных проверок:"
+            for (i = 1; i <= nd; i++) {
+                d = ord[i]
+                printf "\n%s — проверок %d\n", d, n[d]
+                ws = stages(d, "w"); ts = stages(d, "t")
+                printf "  напрямую: %s%s\n", pct(wok[d], wn[d]), (ws ? " (сбои: " ws ")" : "")
+                printf "  туннель:  %s%s\n", pct(tok[d], n[d]), (ts ? " (сбои: " ts ")" : "")
+                printf "  последняя: %s\n", last[d]
+            }
+        }'
+    if [ -f "$LOG_DIR/events.log" ]; then
+        awk -v from="$from" '
+            { t = $3; sub(/^ts=/, "", t); if (t + 0 < from) next }
+            $4 == "domain_changed" { c++; l = l "\n  " $1 " " $2 " " $5 " " $6 " " $7 }
+            END { if (c) printf "\nИзменения доступности: %d%s\n", c, l }' "$LOG_DIR/events.log" 2>/dev/null
     fi
 }
 
@@ -648,6 +1445,12 @@ cmd_bundle() {
         d=$(echo "${d%.log}" | tr -d -)
         is_num "$d" && [ "$d" -ge "$cutoff" ] && set -- "$@" "samples/${f##*/}"
     done
+    for f in "$LOG_DIR"/domains/*.log; do
+        [ -e "$f" ] || continue
+        d=${f##*/}
+        d=$(echo "${d%.log}" | tr -d -)
+        is_num "$d" && [ "$d" -ge "$cutoff" ] && set -- "$@" "domains/${f##*/}"
+    done
     for f in events.log events.log.1; do
         [ -f "$LOG_DIR/$f" ] && set -- "$@" "$f"
     done
@@ -702,6 +1505,30 @@ update_crontab() {
         cat "$WORK/crontab" > "$CRONTAB"
         echo "Резервная копия расписания: $backup"
     fi
+}
+
+conf_domains() {
+    cat <<EOF
+# Домены (через пробел), которые раз в DOMAINS_EVERY минут проверяются напрямую
+# и через туннель. Пусто — проверки выключены. Проверки идут параллельно.
+DOMAINS_WATCH='$DOMAINS_WATCH'
+DOMAINS_EVERY=$DOMAINS_EVERY
+# Таймаут одной проверки домена, с.
+DOMAIN_TIMEOUT=$DOMAIN_TIMEOUT
+# Интерфейс провайдера для проверки «напрямую»; пусто — из маршрута по умолчанию.
+WAN_IFACE=$WAN_IFACE
+# DNS роутера для route-check.
+DNS_SERVER=$DNS_SERVER
+# Поиск доменов мимо туннеля (awg-monitor missed): 1 — включить. Нужен tcpdump
+# (opkg install tcpdump); он слушает ответы DNS роутера клиентам на LAN_IFACE.
+DNS_CAPTURE=$DNS_CAPTURE
+LAN_IFACE=$LAN_IFACE
+# Сколько новых доменов в минуту проверять напрямую и через туннель; повтор через столько часов.
+MISSED_PROBES=$MISSED_PROBES
+MISSED_RECHECK=$MISSED_RECHECK
+# Считать подозрительными TLS-соединения, где сервер почти ничего не ответил (0 — выключить).
+MISSED_STALL=$MISSED_STALL
+EOF
 }
 
 cmd_install() {
@@ -793,6 +1620,8 @@ CONFIG_EVERY=$CONFIG_EVERY
 KEEP_DAYS=$KEEP_DAYS
 EOF
     fi
+    # Configs from older versions get the new settings appended once.
+    grep -q '^DOMAINS_WATCH=' "$WORK/conf" || conf_domains >> "$WORK/conf"
     mkdir -p "${CONF%/*}" "${BIN%/*}"
     cp "$WORK/conf" "$CONF.tmp.$$"
     mv "$CONF.tmp.$$" "$CONF"
@@ -828,20 +1657,36 @@ cmd_uninstall() {
         update_crontab remove
         if [ -x "$CRON_INIT" ]; then "$CRON_INIT" restart; fi
     fi
+    lock_wait
+    trap 'rm -rf "$WORK" "$LOCK"' 0
+    cap_clean
     if owned "$BIN"; then rm -f "$BIN"; fi
     if owned "$CONF"; then rm -f "$CONF"; fi
-    rm -rf "$LOCK" "$NODIR_FLAG"
+    if owned "$SRC_COPY"; then rm -f "$SRC_COPY"; fi
+    rm -f "$NODIR_FLAG"
+    if [ "$purge" = 1 ]; then
+        for f in "$CRONTAB".awg-monitor-backup.*; do
+            if [ -f "$f" ] && [ ! -L "$f" ]; then rm -f "$f"; fi
+        done
+    fi
     if logdir_ok; then
         if [ "$purge" = 1 ]; then
-            rm -rf "$LOG_DIR/samples" "$LOG_DIR/dumps" "$LOG_DIR/snapshots" "$LOG_DIR/bundles"
-            rm -f "$LOG_DIR/events.log" "$LOG_DIR/events.log.1" "$LOG_DIR/state" "$LOG_DIR/state.tmp" "$LOG_DIR/$DIR_MARKER"
+            rm -rf "$LOG_DIR/samples" "$LOG_DIR/domains" "$LOG_DIR/missed" "$LOG_DIR/dumps" "$LOG_DIR/snapshots" "$LOG_DIR/bundles"
+            rm -f "$LOG_DIR/events.log" "$LOG_DIR/events.log.1" "$LOG_DIR/state" "$LOG_DIR/state.tmp" \
+                "$LOG_DIR/domains.state" "$LOG_DIR/domains.state.tmp" "$LOG_DIR/missed.cache" "$LOG_DIR/$DIR_MARKER"
             rmdir "$LOG_DIR" 2>/dev/null || :
             echo "Логи удалены: $LOG_DIR"
         else
             echo "Логи сохранены: $LOG_DIR (удалить: uninstall --purge)"
         fi
     fi
-    echo 'awg-monitor удалён. Пакет cron и другие задания сохранены.'
+    echo 'awg-monitor удалён. Другие задания cron сохранены.'
+    left=$(ram_files | grep -v -e "^$LOCK\$" -e "^$WORK\$" || :)
+    [ -z "$left" ] || echo "Осталось в /tmp: $(echo $left)"
+    [ "$purge" = 1 ] || echo "Резервные копии crontab ($CRONTAB.awg-monitor-backup.*) сохранены — удаляются с --purge."
+    pk=$(pkg_list)
+    [ -z "$pk" ] || echo "Пакеты Entware не удалялись (могут быть нужны другим): $pk. Удалить ненужные: opkg remove ИМЯ"
+    echo 'Записи в системном журнале роутера (logger -t awg-monitor) остаются до его очистки/перезагрузки.'
 }
 
 ACTION=${1:-}
@@ -849,8 +1694,10 @@ ACTION=${1:-}
 case $ACTION in
     install) cmd_install "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
+    enable) load_conf; cmd_enable "$@" ;;
+    disable) load_conf; cmd_disable "$@" ;;
     -h|--help|help|'') usage ;;
-    collect|check|status|report|snapshot|snapshots|diff|bundle)
+    collect|check|status|report|snapshot|snapshots|diff|bundle|check-domain|domains|route-check|missed)
         load_conf
         case $ACTION in
             collect) cmd_collect ;;
@@ -861,6 +1708,10 @@ case $ACTION in
             snapshots) cmd_snapshots ;;
             diff) cmd_diff "$@" ;;
             bundle) cmd_bundle "$@" ;;
+            check-domain) cmd_check_domain "$@" ;;
+            route-check) cmd_route_check "$@" ;;
+            missed) [ "$#" -le 1 ] || die 'missed принимает один аргумент.'; cmd_missed "$@" ;;
+            domains) [ "$#" -le 1 ] || die 'domains принимает один аргумент.'; cmd_domains "$@" ;;
         esac ;;
     *) usage; exit 1 ;;
 esac
