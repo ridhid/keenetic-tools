@@ -141,6 +141,24 @@ awg-monitor uninstall --purge
 Пакеты Entware (`cron`, `curl`, `ca-bundle`, `tcpdump`) не удаляются — они могут быть нужны другим
 программам; `uninstall` перечисляет установленные. Записи в системном журнале роутера остаются до его очистки.
 
+## SSH: пользователь со входом по ключу и sudo
+
+Создаёт пользователя (по умолчанию `admin`) с домашним каталогом `/opt/home/ИМЯ`, копирует ему ключи из
+`/opt/root/.ssh/authorized_keys`, ставит `sudo` и разрешает этому пользователю `sudo`. В конце спрашивает
+пароль — его будет запрашивать `sudo`. Перед изменением `/opt/etc/passwd`, `group`, `sudoers` делает копии
+`*.bak-adduser`. Повторный запуск ничего не дублирует.
+
+Нужен, если dropbear не принимает ключ для root: в сборке Entware ключи root он может искать не в `~/.ssh`,
+а в `/opt/etc/dropbear/authorized_keys` (проверка: `strings $(which dropbear) | grep authorized_keys`).
+
+Сначала положите свой публичный ключ в `/opt/root/.ssh/authorized_keys`, затем:
+
+```sh
+opkg update && opkg install curl ca-bundle && curl -fSL https://raw.githubusercontent.com/ridhid/keenetic-tools/main/scripts/add-ssh-user.sh -o /opt/add-ssh-user.sh.part && mv /opt/add-ssh-user.sh.part /opt/add-ssh-user.sh && sh /opt/add-ssh-user.sh admin
+```
+
+Проверить с компьютера, **не закрывая сессию root**: `ssh admin@192.168.1.1`, затем `sudo -i`.
+
 ## Сборка из исходников
 
 Собирается на компьютере (Linux, macOS, WSL; нужны Go и make), не на роутере. Версия Go берётся из `go.mod`

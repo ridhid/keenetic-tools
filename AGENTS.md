@@ -33,6 +33,7 @@ README в `main` должен описывать последний релиз.
 | `Makefile` | `build`/`all`/`deploy`/`test`/`verify`/`clean` |
 | `.goreleaser.yaml` | релизная сборка; флаги совпадают с `Makefile` (иначе `make verify` не сойдётся) |
 | `docs/go-migration.md` | решения и история перехода с shell на Go |
+| `scripts/add-ssh-user.sh` | Разовая shell-утилита (не часть бинарника): пользователь со входом по SSH-ключу (ключи из `/opt/root/.ssh/authorized_keys`) и правом `sudo`. Правит `/opt/etc/passwd`, `group`, `sudoers` с бэкапами `*.bak-adduser`, идемпотентна. Скачивается напрямую из `main`, поэтому push в `main` для неё — релиз; только POSIX sh (BusyBox ash). |
 
 ## Раскладка на роутере
 
@@ -91,6 +92,7 @@ go vet ./...
 go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 go test ./...                  # в CI ещё -race
 make all                       # 4 архитектуры, размер ≤ 8 МиБ
+sh -n scripts/*.sh             # синтаксис shell-утилит
 git ls-files --eol             # везде lf
 ```
 
