@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          [ -z "$out" ] || { echo "$out"; exit 1; }
+      - run: go vet ./...
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - run: go test -race ./...
+      - name: shell scripts syntax
+        run: sh -n scripts/*.sh
+      - name: LF line endings
+        run: |
+          bad=$(git ls-files --eol | awk '$1 != "i/lf" && $1 != "i/none" && $1 != "i/-text"')
+          [ -z "$bad" ] || { echo "$bad"; exit 1; }
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make all
+      - name: size budget (8 MiB)
+        run: |
+          for f in dist/*; do
+            s=$(wc -c < "$f"); echo "$f $s"
+            [ "$s" -le 8388608 ] || { echo "$f is over budget"; exit 1; }
+          done
+      - name: reproducible
+        run: |
+          sha256sum dist/* > first.sha256
+          make clean all
+          sha256sum -c first.sha256
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: check

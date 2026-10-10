@@ -4,110 +4,103 @@
 
 ## Что это
 
-Набор shell-утилит для роутеров **Keenetic с Entware**:
+Один статический Go-бинарник `keenetic-tools` для роутеров **Keenetic с Entware**:
 
-- `install-awg-cron.sh` — установщик cron-задания, которое периодически
+- `keenetic-tools awg-cron install [hourly|daily] | uninstall | run` — cron-задание, которое
   перезапускает AmneziaWG-туннель через `/opt/etc/init.d/S52awg-opkgtun0 restart`;
-- `awg-monitor.sh` — мониторинг качества туннеля (замеры, события, дампы при
-  сбоях, снимки конфигурации).
+- `keenetic-tools awg-monitor КОМАНДА` (или `awg-monitor КОМАНДА` через симлинк) — мониторинг
+  туннеля: замеры, события, дампы при сбоях, снимки конфигурации, проверки доменов, поиск
+  соединений мимо туннеля.
 
-Код исполняется **только на роутере** (Entware, BusyBox `ash`, под root), а не на
-машине разработчика. Пользователь скачивает скрипт напрямую из ветки `main`
-по ссылке из `README.md`, поэтому **push в `main` = релиз**.
+Бинарник исполняется **только на роутере** (под root), собирается кросс-компиляцией на ПК.
+Пользователь ставит его из **GitHub Releases** по однострочнику из `README.md`; релиз — это тег
+`v*` (GoReleaser в `.github/workflows/release.yml`). Push в `main` релизом не является, но
+README в `main` должен описывать последний релиз.
 
-## Файлы
+## Структура
 
-| Файл | Назначение |
+| Путь | Назначение |
 |------|------------|
-| `awg-monitor.sh` | Монитор туннеля; этот же файл — установщик (`install [--log-dir DIR]` копирует себя в `/opt/bin/awg-monitor`). |
-| `install-awg-cron.sh` | Точка входа рестарта по cron. `install [hourly\|daily]` / `uninstall`. Самодостаточный: ничего не скачивает, тело задания встроено heredoc'ом. |
-| `scripts/add-ssh-user.sh` | Разовая утилита: пользователь со входом по SSH-ключу (ключи из `/opt/root/.ssh/authorized_keys`) и правом `sudo`. Правит `/opt/etc/passwd`, `group`, `sudoers` с бэкапами `*.bak-adduser`, идемпотентна. |
-| `awg-restart` | **Legacy**. Старый скрипт из `/opt/etc/cron.hourly/`. Нужен только как эталон для миграции; новые установки его не используют. |
-| `README.md` | Инструкция для пользователя (на русском) с однострочником установки. |
+| `cmd/keenetic-tools/` | диспетчер: подкоманды и `argv[0] == awg-monitor`; встроенный маркер бинарника |
+| `internal/sys/` | граница с системой: `Env` (префикс путей `Root`, `Runner` для внешних команд, часы, `Sleep`, `Kill`), атомарная запись, `flock`, `FSType` |
+| `internal/sys/systest/` | фейковый роутер для тестов: `t.TempDir()` как корень, сценарные команды, фиксированное время |
+| `internal/markers/` | маркеры файлов и строк crontab — **не менять** после релиза |
+| `internal/crontab/` | правка `/opt/etc/crontab` по суффиксу-маркеру с бэкапом; установка/перезапуск cron |
+| `internal/conf/` | разбор `KEY=value`-конфига без shell-семантики, правка с сохранением комментариев |
+| `internal/selfbin/` | установка себя в `/opt/bin/keenetic-tools`, симлинк `/opt/bin/awg-monitor` |
+| `internal/awgcron/` | `awg-cron` |
+| `internal/monitor/` | `awg-monitor`: замер (`probe.go`), сбор (`collect.go`), снимки и diff, домены, маршрутизация, захват DNS, отчёты, bundle, установка |
+| `Makefile` | `build`/`all`/`deploy`/`test`/`verify`/`clean` |
+| `.goreleaser.yaml` | релизная сборка; флаги совпадают с `Makefile` (иначе `make verify` не сойдётся) |
+| `docs/go-migration.md` | решения и история перехода с shell на Go |
+| `scripts/add-ssh-user.sh` | Разовая shell-утилита (не часть бинарника): пользователь со входом по SSH-ключу (ключи из `/opt/root/.ssh/authorized_keys`) и правом `sudo`. Правит `/opt/etc/passwd`, `group`, `sudoers` с бэкапами `*.bak-adduser`, идемпотентна. Скачивается напрямую из `main`, поэтому push в `main` для неё — релиз; только POSIX sh (BusyBox ash). |
 
-## Как работает установщик
+## Раскладка на роутере
 
-- Ставит задание в `/opt/sbin/awg-scheduled-restart` (с маркером в 2-й строке).
-- Добавляет строку в `/opt/etc/crontab` с суффиксом-маркером
-  `# keenetic-awg-restart: managed by install-awg-cron.sh`; удаляет только строки
-  с этим суффиксом, остальные записи не трогает. Перед изменением делает бэкап
-  `crontab.awg-backup.XXXXXX`.
-- Расписание: `hourly` → `01 * * * *`, `daily` → `02 4 * * *`.
-- Мигрирует старые `/opt/etc/cron.{hourly,daily}/awg-restart`, но **только если**
-  их код (без комментариев/пустых строк) совпадает с legacy-версией
-  (с учётом исторической опечатки `s52awg-opgktun0`). Иначе — отказ без изменений.
-- Отказывается перезаписывать `$JOB`, если это не наш файл (нет маркера, симлинк).
-- При установке туннель **не** перезапускается; перезапускается только `S10cron`.
-- `uninstall` удаляет задание и строку из crontab, пакет `cron` оставляет.
-- Задание ограничивает `restart` таймаутом `TIMEOUT=120` с: фоновый `sleep`,
-  затем `kill -KILL` (код 137). Убивается только сам init-скрипт, не его потомки.
-  Если жив PID из `/tmp/awg-restart.pid`, запуск пропускается с записью в лог.
-- Лог последнего запуска: `/tmp/awg-restart.log` (перезаписывается, RAM;
-  строка о пропуске из-за lock дописывается в конец).
+- `/opt/bin/keenetic-tools` — бинарник; «наш», если содержит строку `# keenetic-tools: keenetic-tools`
+  (`markers.Embedded`, используется в `main`, чтобы линкер её не выбросил).
+- `/opt/bin/awg-monitor` — симлинк на `keenetic-tools`.
+- `/opt/etc/awg-monitor.conf` — конфиг; 1-я строка `# keenetic-tools: awg-monitor`.
+- `/opt/etc/crontab`: `* * * * * root /opt/bin/awg-monitor collect >/dev/null 2>&1 # keenetic-tools: awg-monitor`
+  и `01 * * * * root /opt/bin/keenetic-tools awg-cron run # keenetic-tools: awg-cron`.
+  Бэкапы: `crontab.awg-monitor-backup.XXXXXX`, `crontab.awg-backup.XXXXXX`.
+- `/tmp/awg-restart.lock`, `/tmp/awg-monitor.lock` — `flock` с PID внутри; `/tmp/awg-restart.log` —
+  лог последнего рестарта; `/tmp/awg-monitor.*` — состояние захвата DNS (RAM).
+- Бинарник удаляется только последним компонентом: `awg-cron uninstall` оставляет его, если
+  установлен монитор, и наоборот.
 
 ## Как работает awg-monitor
 
-- Маркер `# keenetic-tools: awg-monitor` — 2-я строка скрипта, 1-я строка
-  `/opt/etc/awg-monitor.conf` и суффикс строки в `/opt/etc/crontab`
-  (`* * * * * root /opt/bin/awg-monitor collect`). Не менять — по нему
-  находятся установленные копии.
-- Каталог логов задаётся `--log-dir`, хранится в конфиге (`LOG_DIR`). Установщик
-  отказывается от каталогов на `tmpfs`/`ramfs`/внутренней флеш-ФС. В каталоге
-  лежит файл-маркер `.awg-monitor`: без него `collect` ничего не пишет (диск
-  отключён — не писать в пустую точку монтирования в RAM).
-- `collect` (cron, раз в минуту): lock `/tmp/awg-monitor.lock`, замер, строка
-  `key=value` в `samples/ДАТА.log`, события в `events.log` + `logger`, дамп при
-  переходе в `DOWN`, хэш конфигурации раз в `CONFIG_EVERY` минут → снимок при
-  изменении, раз в сутки удаление старше `KEEP_DAYS`, состояние в `state`.
-- Секреты (`PrivateKey`, `PresharedKey`) вырезаются из снимков; `bundle`
-  проверяет архив на ключи из конфига AWG и удаляет его при совпадении.
-- Формат строки замера читают `report` и `status`: при добавлении полей не
-  менять смысл существующих ключей.
+- Каталог логов задаётся `--log-dir`, хранится в конфиге (`LOG_DIR`). Установщик отказывается от
+  каталогов на `tmpfs`/`ramfs`/внутренней флеш-ФС. В каталоге лежит файл-маркер `.awg-monitor`: без
+  него `collect` ничего не пишет (диск отключён — не писать в пустую точку монтирования в RAM).
+- `collect` (cron, раз в минуту): `flock`, замер, строка `key=value` в `samples/ДАТА.log`, события в
+  `events.log` + syslog, дамп при переходе в `DOWN`, хэш конфигурации раз в `CONFIG_EVERY` минут →
+  снимок при изменении, раз в сутки удаление старше `KEEP_DAYS`, состояние в `state`.
+- Секреты (`PrivateKey`, `PresharedKey`) вырезаются из снимков; `bundle` проверяет архив на ключи из
+  конфига AWG и удаляет его при совпадении.
+- Формат строки замера читают `report` и `status`: при добавлении полей не менять смысл
+  существующих ключей. Так же — `domains/*.log`, `missed/*.log`, `events.log`.
+- Сетевые пробы — `net/http` с `SO_BINDTODEVICE` (`internal/monitor/net.go`), стадия сбоя
+  `dns`/`tcp`/`tls`/`http`/`cert`/`iface` по `httptrace`. Внешние команды: `awg`, `ping`, `ndmc`,
+  `opkg`, `ip`, `tcpdump`, `dmesg`, `top`, `free`, init-скрипты; вывод `ndmc` очищается от `ESC[K`.
 
 ## Правила для изменений
 
-1. **Только POSIX sh** (BusyBox ash). Никаких bash-измов: `[[ ]]`, массивы,
-   `local` нежелателен, `$'...'`, `<<<`, `pipefail`, `sed -i` с GNU-опциями,
-   `readlink -f` и т.п. Используемые утилиты должны быть в BusyBox/Entware.
-2. Сохранять `set -eu`, явный `PATH` с `/opt/...` впереди, `trap cleanup`.
-3. **Безопасность прежде всего**: скрипт работает под root на роутере.
-   Не удалять и не перезаписывать то, что установщик не создавал; проверять
-   маркер, симлинки, существование файлов. Новая логика должна быть
-   идемпотентной (повторный `install` не плодит дубликаты).
-4. Сообщения пользователю (`echo`, `die`, `usage`) — **на русском**;
-   комментарии в коде — на английском, коротко.
-5. Окончания строк — **LF** (`.gitattributes` это навязывает для `*.sh` и
-   `awg-restart`). Репо лежит на Windows-ФС — не допускать CRLF.
-6. **Не менять `awg-restart`** и heredoc `legacy` в установщике по отдельности:
-   они должны совпадать по коду, иначе миграция старых установок сломается.
-   Тело нового задания (heredoc в блоке `install`) — отдельная копия; при его
-   изменении учитывать, что `is_legacy` его не касается.
-7. Не менять строку `MARKER` — по ней находятся уже установленные задания
-   на роутерах пользователей.
-8. При изменении CLI/поведения обновить `usage()` и `README.md`
-   (однострочник установки должен оставаться рабочим).
+1. **Безопасность прежде всего**: бинарник работает под root на роутере. Не удалять и не
+   перезаписывать то, что установщик не создавал; проверять маркер, симлинки, существование
+   файлов. Новая логика должна быть идемпотентной (повторный `install` не плодит дубликаты).
+2. Все пути роутера — через `env.P(...)`/методы `Env`, все внешние команды — через `env.Run`,
+   время — через `env.Now`. Иначе код нельзя проверить на фейковом роутере.
+3. Только stdlib и `golang.org/x/crypto/x509roots/fallback`. `CGO_ENABLED=0`.
+4. Сообщения пользователю — **на русском**; комментарии в коде — на английском, коротко.
+5. Не менять маркеры (`internal/markers`) и строки crontab — по ним находятся установленные копии.
+6. При изменении CLI/поведения обновить `usage()` и `README.md`.
+7. Флаги сборки в `Makefile` и `.goreleaser.yaml` должны совпадать; версия Go — строка `toolchain`
+   в `go.mod`.
+8. Окончания строк — **LF** (`.gitattributes`). Репо лежит на Windows-ФС — не допускать CRLF.
 
 ## Проверка
 
-Роутера в окружении нет, и **запускать установщик локально нельзя** — он пишет
-в `/opt`, вызывает `opkg` и init-скрипты. Доступные проверки:
+Роутера в окружении нет; **не запускать** `install`/`uninstall`/`collect`/`enable`/`disable`/`awg-cron`
+на машине разработчика — они пишут в `/opt`, вызывают `opkg` и init-скрипты. Всё проверяется тестами
+на фейковом роутере (`internal/sys/systest`):
 
 ```sh
-sh -n install-awg-cron.sh awg-restart awg-monitor.sh scripts/*.sh   # синтаксис
-shellcheck --shell=sh -e SC2015,SC2013 install-awg-cron.sh awg-restart awg-monitor.sh   # если установлен
-busybox ash -n install-awg-cron.sh awg-monitor.sh      # если есть busybox
-git ls-files --eol                             # убедиться, что везде lf
+gofmt -l .                     # пусто
+go vet ./...
+go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+go test ./...                  # в CI ещё -race
+make all                       # 4 архитектуры, размер ≤ 8 МиБ
+sh -n scripts/*.sh             # синтаксис shell-утилит
+git ls-files --eol             # везде lf
 ```
 
-Если нужно проверить логику — делать это в изолированной копии с подменой
-путей (`JOB`, `CRONTAB`, `CRON_INIT`, `SERVICE`) на каталог во временной
-директории, не трогая реальную систему. Для `awg-monitor.sh` — подменить
-`PATH` (заглушки `awg`, `ping`, `pgrep`, `curl`, `ndmc`, `opkg`, `logger`, `id`),
-`/opt/`, `/tmp/awg-monitor*` и `/sys/class/net` через `sed` в копии и прогнать
-сценарии `collect` (OK, потери, DOWN по каждой причине, отключённый диск, lock),
-затем `report`, `diff`, `bundle`, `uninstall --purge`.
+Новое поведение — новый сценарий в `*_test.go`: фикстуры вывода команд через `Runner.On`/`OnFunc`,
+файлы `/proc`, `/sys`, конфиги — через `Router.Write`, сеть — `fakeNet` в тестах монитора.
 
 ## Git
 
-- Ветка по умолчанию — `main`; GitHub: `ridhid/keenetic-tools`.
+- Ветка по умолчанию — `main`; GitHub: `asiforis/keenetic-tools`.
+- Релиз: тег `vX.Y.Z` → GoReleaser публикует бинарники и `SHA256SUMS`, затем workflow сверяет их с `make all`.
 - Не коммитить секреты, бэкапы и логи роутера (см. `.gitignore`).

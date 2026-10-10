@@ -1,0 +1,46 @@
+# Release build: the same binaries as `make all` (see Makefile), so anyone can
+# rebuild a tag and compare hashes with `make verify TAG=...`.
+version: 2
+
+project_name: keenetic-tools
+
+builds:
+  - id: keenetic-tools
+    main: ./cmd/keenetic-tools
+    binary: keenetic-tools
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    # Must match LDFLAGS in the Makefile; the version is the tag with its "v".
+    ldflags:
+      - -s -w -buildid= -X main.version={{ .Tag }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos: [linux]
+    goarch: [mipsle, mips, arm64, arm]
+    gomips: [softfloat]
+    goarm: ["5"]
+
+archives:
+  # Plain binaries named after Entware architectures (opkg print-architecture
+  # without "sf"), which is what the install one-liner downloads.
+  - formats: [binary]
+    name_template: >-
+      keenetic-tools-
+      {{- if eq .Arch "mipsle" }}mipsel
+      {{- else if eq .Arch "arm64" }}aarch64
+      {{- else if eq .Arch "arm" }}armv7
+      {{- else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: SHA256SUMS
+  algorithm: sha256
+
+changelog:
+  use: github
+  sort: asc
+
+release:
+  draft: false
+  prerelease: auto
