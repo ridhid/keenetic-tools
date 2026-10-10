@@ -21,6 +21,7 @@
 |------|------------|
 | `awg-monitor.sh` | Монитор туннеля; этот же файл — установщик (`install [--log-dir DIR]` копирует себя в `/opt/bin/awg-monitor`). |
 | `install-awg-cron.sh` | Точка входа рестарта по cron. `install [hourly\|daily]` / `uninstall`. Самодостаточный: ничего не скачивает, тело задания встроено heredoc'ом. |
+| `scripts/add-ssh-user.sh` | Разовая утилита: пользователь со входом по SSH-ключу (ключи из `/opt/root/.ssh/authorized_keys`) и правом `sudo`. Правит `/opt/etc/passwd`, `group`, `sudoers` с бэкапами `*.bak-adduser`, идемпотентна. |
 | `awg-restart` | **Legacy**. Старый скрипт из `/opt/etc/cron.hourly/`. Нужен только как эталон для миграции; новые установки его не используют. |
 | `README.md` | Инструкция для пользователя (на русском) с однострочником установки. |
 
@@ -92,7 +93,7 @@
 в `/opt`, вызывает `opkg` и init-скрипты. Доступные проверки:
 
 ```sh
-sh -n install-awg-cron.sh awg-restart awg-monitor.sh   # синтаксис
+sh -n install-awg-cron.sh awg-restart awg-monitor.sh scripts/*.sh   # синтаксис
 shellcheck --shell=sh -e SC2015,SC2013 install-awg-cron.sh awg-restart awg-monitor.sh   # если установлен
 busybox ash -n install-awg-cron.sh awg-monitor.sh      # если есть busybox
 git ls-files --eol                             # убедиться, что везде lf
