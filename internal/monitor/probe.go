@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ridhid/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/sys"
 )
 
 // State is the collect state kept between runs in LOG_DIR/state.

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ridhid/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/sys"
 )
 
 // Strip drops lines that end with marker. Every kept line gets a trailing

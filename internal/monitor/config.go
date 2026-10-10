@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ridhid/keenetic-tools/internal/conf"
-	"github.com/ridhid/keenetic-tools/internal/markers"
+	"github.com/asiforis/keenetic-tools/internal/conf"
+	"github.com/asiforis/keenetic-tools/internal/markers"
 )
 
 // Config is /opt/etc/awg-monitor.conf over the defaults.

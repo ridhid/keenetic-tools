@@ -32,7 +32,7 @@ LDFLAGS     := -s -w -buildid= -X main.version=$(VERSION)
 # One SSH connection for all steps: a single password prompt without keys.
 SSH := ssh -p $(SSH_PORT) -o ControlMaster=auto -o ControlPath=/tmp/kt-ssh-%C -o ControlPersist=60
 
-REPO     ?= ridhid/keenetic-tools
+REPO     ?= asiforis/keenetic-tools
 
 .PHONY: build all deploy test verify clean
 

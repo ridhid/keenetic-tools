@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ridhid/keenetic-tools/internal/markers"
-	"github.com/ridhid/keenetic-tools/internal/selfbin"
-	"github.com/ridhid/keenetic-tools/internal/sys"
-	"github.com/ridhid/keenetic-tools/internal/sys/systest"
+	"github.com/asiforis/keenetic-tools/internal/markers"
+	"github.com/asiforis/keenetic-tools/internal/selfbin"
+	"github.com/asiforis/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/sys/systest"
 )
 
 const (

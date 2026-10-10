@@ -10,11 +10,11 @@ import (
 	"path/filepath"
 	"runtime/debug"
 
-	"github.com/ridhid/keenetic-tools/internal/awgcron"
-	"github.com/ridhid/keenetic-tools/internal/markers"
-	"github.com/ridhid/keenetic-tools/internal/monitor"
-	"github.com/ridhid/keenetic-tools/internal/selfbin"
-	"github.com/ridhid/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/awgcron"
+	"github.com/asiforis/keenetic-tools/internal/markers"
+	"github.com/asiforis/keenetic-tools/internal/monitor"
+	"github.com/asiforis/keenetic-tools/internal/selfbin"
+	"github.com/asiforis/keenetic-tools/internal/sys"
 )
 
 var version = "dev"

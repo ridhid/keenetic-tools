@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ridhid/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/sys"
 )
 
 // Handler produces the result of a fake command.

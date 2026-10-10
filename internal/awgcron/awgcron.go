@@ -10,10 +10,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/ridhid/keenetic-tools/internal/crontab"
-	"github.com/ridhid/keenetic-tools/internal/markers"
-	"github.com/ridhid/keenetic-tools/internal/selfbin"
-	"github.com/ridhid/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/crontab"
+	"github.com/asiforis/keenetic-tools/internal/markers"
+	"github.com/asiforis/keenetic-tools/internal/selfbin"
+	"github.com/asiforis/keenetic-tools/internal/sys"
 )
 
 const (

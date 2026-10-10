@@ -101,6 +101,6 @@ git ls-files --eol             # везде lf
 
 ## Git
 
-- Ветка по умолчанию — `main`; GitHub: `ridhid/keenetic-tools`.
+- Ветка по умолчанию — `main`; GitHub: `asiforis/keenetic-tools`.
 - Релиз: тег `vX.Y.Z` → GoReleaser публикует бинарники и `SHA256SUMS`, затем workflow сверяет их с `make all`.
 - Не коммитить секреты, бэкапы и логи роутера (см. `.gitignore`).

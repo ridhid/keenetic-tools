@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ridhid/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/sys"
 )
 
 func sec(b *bytes.Buffer, name string) { fmt.Fprintf(b, "\n### %s\n", name) }

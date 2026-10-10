@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ridhid/keenetic-tools/internal/markers"
-	"github.com/ridhid/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/markers"
+	"github.com/asiforis/keenetic-tools/internal/sys"
 )
 
 // The release flags strip symbols; the marker line must survive them on

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ridhid/keenetic-tools/internal/sys"
-	"github.com/ridhid/keenetic-tools/internal/sys/systest"
+	"github.com/asiforis/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/sys/systest"
 )
 
 func TestDomNorm(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/ridhid/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/sys"
 )
 
 // capPID returns the PID of our running tcpdump, 0 if none.

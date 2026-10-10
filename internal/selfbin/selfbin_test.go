@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ridhid/keenetic-tools/internal/markers"
-	"github.com/ridhid/keenetic-tools/internal/sys/systest"
+	"github.com/asiforis/keenetic-tools/internal/markers"
+	"github.com/asiforis/keenetic-tools/internal/sys/systest"
 )
 
 func fakeBinary(t *testing.T, version string) string {

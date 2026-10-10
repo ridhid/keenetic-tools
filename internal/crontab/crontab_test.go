@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ridhid/keenetic-tools/internal/sys/systest"
+	"github.com/asiforis/keenetic-tools/internal/sys/systest"
 )
 
 const (

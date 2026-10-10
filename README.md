@@ -6,19 +6,19 @@
 ## Установка
 
 Бинарники для `mipsel`, `mips`, `aarch64` и `armv7` публикуются в
-[GitHub Releases](https://github.com/ridhid/keenetic-tools/releases) вместе с `SHA256SUMS`.
+[GitHub Releases](https://github.com/asiforis/keenetic-tools/releases) вместе с `SHA256SUMS`.
 Архитектура роутера определяется по `opkg print-architecture`.
 
 **1. Скачать** (нужны `curl` и `ca-bundle` — только для этой загрузки):
 
 ```sh
-opkg update && opkg install curl ca-bundle && A=$(opkg print-architecture | sed -n 's/^arch \([a-z0-9]*\)-k\{0,1\}[0-9].*/\1/p' | sed 's/sf$//' | head -n 1) && echo "Архитектура: $A" && curl -fSL "https://github.com/ridhid/keenetic-tools/releases/latest/download/keenetic-tools-$A" -o /opt/keenetic-tools.part && chmod 755 /opt/keenetic-tools.part && /opt/keenetic-tools.part version
+opkg update && opkg install curl ca-bundle && A=$(opkg print-architecture | sed -n 's/^arch \([a-z0-9]*\)-k\{0,1\}[0-9].*/\1/p' | sed 's/sf$//' | head -n 1) && echo "Архитектура: $A" && curl -fSL "https://github.com/asiforis/keenetic-tools/releases/latest/download/keenetic-tools-$A" -o /opt/keenetic-tools.part && chmod 755 /opt/keenetic-tools.part && /opt/keenetic-tools.part version
 ```
 
 Сверить с `SHA256SUMS` релиза (необязательно, если есть `sha256sum`):
 
 ```sh
-cd /opt && curl -fsSL https://github.com/ridhid/keenetic-tools/releases/latest/download/SHA256SUMS | grep " keenetic-tools-$A\$" | sed "s/keenetic-tools-$A\$/keenetic-tools.part/" | sha256sum -c -
+cd /opt && curl -fsSL https://github.com/asiforis/keenetic-tools/releases/latest/download/SHA256SUMS | grep " keenetic-tools-$A\$" | sed "s/keenetic-tools-$A\$/keenetic-tools.part/" | sha256sum -c -
 ```
 
 **2. Установить нужное** — `install` копирует себя в `/opt/bin/keenetic-tools`, после чего загрузку можно удалить:
@@ -154,7 +154,7 @@ awg-monitor uninstall --purge
 Сначала положите свой публичный ключ в `/opt/root/.ssh/authorized_keys`, затем:
 
 ```sh
-opkg update && opkg install curl ca-bundle && curl -fSL https://raw.githubusercontent.com/ridhid/keenetic-tools/main/scripts/add-ssh-user.sh -o /opt/add-ssh-user.sh.part && mv /opt/add-ssh-user.sh.part /opt/add-ssh-user.sh && sh /opt/add-ssh-user.sh admin
+opkg update && opkg install curl ca-bundle && curl -fSL https://raw.githubusercontent.com/asiforis/keenetic-tools/main/scripts/add-ssh-user.sh -o /opt/add-ssh-user.sh.part && mv /opt/add-ssh-user.sh.part /opt/add-ssh-user.sh && sh /opt/add-ssh-user.sh admin
 ```
 
 Проверить с компьютера, **не закрывая сессию root**: `ssh admin@192.168.1.1`, затем `sudo -i`.

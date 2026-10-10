@@ -20,7 +20,7 @@ import (
 	// Root certificates for when the router has none.
 	_ "golang.org/x/crypto/x509roots/fallback"
 
-	"github.com/ridhid/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/sys"
 )
 
 // Fetch is the outcome of one HTTP(S) request.

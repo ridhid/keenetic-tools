@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ridhid/keenetic-tools/internal/markers"
-	"github.com/ridhid/keenetic-tools/internal/selfbin"
+	"github.com/asiforis/keenetic-tools/internal/markers"
+	"github.com/asiforis/keenetic-tools/internal/selfbin"
 )
 
 // fresh is a router without awg-monitor.

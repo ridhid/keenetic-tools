@@ -1,4 +1,4 @@
-module github.com/ridhid/keenetic-tools
+module github.com/asiforis/keenetic-tools
 
 go 1.26.0
 

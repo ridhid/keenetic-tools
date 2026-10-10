@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/ridhid/keenetic-tools/internal/conf"
-	"github.com/ridhid/keenetic-tools/internal/crontab"
-	"github.com/ridhid/keenetic-tools/internal/markers"
-	"github.com/ridhid/keenetic-tools/internal/selfbin"
+	"github.com/asiforis/keenetic-tools/internal/conf"
+	"github.com/asiforis/keenetic-tools/internal/crontab"
+	"github.com/asiforis/keenetic-tools/internal/markers"
+	"github.com/asiforis/keenetic-tools/internal/selfbin"
 )
 
 // Filesystems that live in the router's RAM or internal flash.

@@ -59,7 +59,7 @@ keenetic-tools version
 Однострочник (README):
 
 ```sh
-A=$(opkg print-architecture | sed -n 's/^arch \([a-z0-9]*\)-k\{0,1\}[0-9].*/\1/p' | sed 's/sf$//' | head -n 1) && curl -fSL "https://github.com/ridhid/keenetic-tools/releases/latest/download/keenetic-tools-$A" -o /opt/keenetic-tools.part && chmod 755 /opt/keenetic-tools.part && /opt/keenetic-tools.part awg-monitor install --log-dir /tmp/mnt/HDD/awg-monitor; rm -f /opt/keenetic-tools.part
+A=$(opkg print-architecture | sed -n 's/^arch \([a-z0-9]*\)-k\{0,1\}[0-9].*/\1/p' | sed 's/sf$//' | head -n 1) && curl -fSL "https://github.com/asiforis/keenetic-tools/releases/latest/download/keenetic-tools-$A" -o /opt/keenetic-tools.part && chmod 755 /opt/keenetic-tools.part && /opt/keenetic-tools.part awg-monitor install --log-dir /tmp/mnt/HDD/awg-monitor; rm -f /opt/keenetic-tools.part
 ```
 
 `install`, запущенный не из `/opt/bin/keenetic-tools`, копирует себя туда (`/proc/self/exe`,
@@ -124,7 +124,7 @@ tmp + rename). `curl` нужен только для этой загрузки; 
 ## 3. Структура репозитория
 
 ```
-go.mod                          module github.com/ridhid/keenetic-tools; toolchain закреплён
+go.mod                          module github.com/asiforis/keenetic-tools; toolchain закреплён
 Makefile                        build / all / deploy / test / verify / clean (§2a)
 .goreleaser.yaml                релизная сборка 4 арх + SHA256SUMS, те же флаги, что в Makefile
 cmd/keenetic-tools/main.go      диспетчер по argv[0] и подкомандам

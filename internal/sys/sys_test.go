@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ridhid/keenetic-tools/internal/sys"
-	"github.com/ridhid/keenetic-tools/internal/sys/systest"
+	"github.com/asiforis/keenetic-tools/internal/sys"
+	"github.com/asiforis/keenetic-tools/internal/sys/systest"
 )
 
 const marker = "# keenetic-tools: awg-monitor"
